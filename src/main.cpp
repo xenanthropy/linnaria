@@ -219,6 +219,7 @@ int main(int argc, char** argv) {
             { env_ptr, 0, 1280, 720, cmW, cmH, diag }
         );
 
+        /* IGNORE: was experimenting with nativeOnExpansionFileExtracted and nativeUnlockGame
         uint32_t fake_path_ptr = memory.AllocateHeap(64);
         std::strcpy(reinterpret_cast<char*>(memory.GetHostPointer(fake_path_ptr)), "/data/data/com.codeglue.terraria/files/");
         uint32_t on_expansion_extracted = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted");
@@ -234,6 +235,7 @@ int main(int argc, char** argv) {
             // env_ptr, clazz, jboolean (1 = true), jstring (0)
             ExecuteGameFunction(cpu, memory, loader, on_unlock, { env_ptr, 0, 1, 0 });
         }
+        */
 
         // 4. The Main Engine Loop
         // Java Signature: nativeOnUpdate(int i, int i2)
