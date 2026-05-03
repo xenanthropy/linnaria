@@ -94,7 +94,9 @@ Be mindful of platform-specific behavior (ARM vs x86)
 
 ### Non-Goals
 ❌ Full Android emulation
+
 ❌ Supporting modern Terraria versions (defeats the purpose of the project)
+
 ❌ Perfect compatibility with all Android APIs
 
 ### Acknowledgements
