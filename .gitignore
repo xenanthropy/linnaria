@@ -67,3 +67,15 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+## custom stuff
+assets/
+func_list.txt
+*.apk
+*.obb
+
+*.old
+*.bak
+*.copy
+Linnaria
+bar.sh
