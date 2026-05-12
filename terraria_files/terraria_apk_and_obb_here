@@ -1,0 +1,10 @@
+Put your terraria 1.2.12785 APK and OBB in here.
+
+For checksum purposes, make sure your apk is named "Terraria_1.2.12785.apk"
+and the obb "main.12785.com.and.games505.TerrariaPaid.obb".
+
+NOTE: if you'd like to extract the stuff manually, feel free to
+extract the apk's "assets" folder to the root of the repo,
+do the same with the OBB and merge its assets folder contents with the
+apk's assets folder, then extract the libTerraria.so from the APK and
+put it in the "lib" folder in the root of the repo.
