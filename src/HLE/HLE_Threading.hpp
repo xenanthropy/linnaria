@@ -1,0 +1,200 @@
+#pragma once
+#include "SyscallRouter.hpp"
+#include "GuestMemory.hpp"
+#include "ElfLoader.hpp"
+#include "EmuCallbacks.hpp"
+#include "AndroidCP15.hpp"
+
+#include <dynarmic/interface/exclusive_monitor.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <memory>
+#include <unordered_map>
+
+namespace HLE::Threading {
+
+    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor) {
+
+        // TODO: pthread_getspecific, pthread_setspecific, pthread_setname_np
+
+        static std::mutex host_mutex_lock;
+        static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> host_mutexes;
+
+        auto pthread_success = [](Dynarmic::A32::Jit* cpu) {
+            cpu->Regs()[0] = 0; // 0 = Success
+        };
+
+        ROUTE_REGISTER(router, "pthread_attr_setschedparam", pthread_success);
+        ROUTE_REGISTER(router, "pthread_attr_setstacksize", pthread_success);
+        ROUTE_REGISTER(router, "pthread_attr_setdetachstate", pthread_success);
+
+        ROUTE_REGISTER(router, "pthread_mutexattr_init", pthread_success);
+        ROUTE_REGISTER(router, "pthread_mutexattr_settype", pthread_success);
+        ROUTE_REGISTER(router, "pthread_mutexattr_destroy", pthread_success);
+
+        ROUTE_REGISTER(router, "pthread_mutex_init", pthread_success);
+        ROUTE_REGISTER(router, "pthread_cond_init", pthread_success);
+
+        ROUTE_REGISTER(router, "pthread_key_create", pthread_success);
+        ROUTE_REGISTER(router, "pthread_setname_np", pthread_success);
+
+
+        ROUTE_REGISTER(router, "pthread_create", [&memory, &loader, &router, &monitor](Dynarmic::A32::Jit* cpu) {
+            uint32_t thread_ptr = cpu->Regs()[0];
+            uint32_t entry = cpu->Regs()[2];
+            uint32_t arg = cpu->Regs()[3];
+            
+            // Allocate a unique Stack and TLS area for the new thread
+            uint32_t stack_size = 1024 * 1024; 
+            uint32_t sp = memory.AllocateHeap(stack_size) + stack_size;
+            uint32_t tls = memory.AllocateHeap(4096);
+            
+            static std::atomic<int> next_core_id{1};
+            int core_id = next_core_id.fetch_add(1);
+            
+            if (thread_ptr) memory.Write32(thread_ptr, core_id);
+            
+            // Fire off the background thread!
+            std::thread([&memory, &loader, &router, &monitor, entry, arg, sp, tls, core_id, stack_size]() {
+                
+                // Each thread gets its own callback handler pointing to its own CPU
+                EmuCallbacks callbacks(memory, loader, router);
+                
+                Dynarmic::A32::UserConfig config;
+                config.callbacks = &callbacks;
+                config.page_table = &memory.page_table;
+                config.absolute_offset_page_table = false;
+                config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
+                config.recompile_on_fastmem_failure = true;
+                config.arch_version = Dynarmic::A32::ArchVersion::v7;
+                
+                // Share the global monitor, give thread a unique ID and its own CP15/TLS
+                config.global_monitor = &monitor;
+                config.processor_id = core_id;
+                config.coprocessors[15] = std::make_shared<AndroidCP15>(tls);
+                
+                Dynarmic::A32::Jit thread_cpu(config);
+                callbacks.cpu = &thread_cpu;
+                
+                // Setup initial Registers
+                thread_cpu.Regs()[13] = sp;
+                thread_cpu.Regs()[0] = arg;
+                thread_cpu.Regs()[14] = loader.GetThunk("pthread_exit");
+                thread_cpu.Regs()[15] = entry & ~1;
+                thread_cpu.SetCpsr((entry & 1) ? 0x30 : 0x10);
+                
+                // Background Emulator Loop!
+                while (true) {
+                    auto halt = thread_cpu.Run();
+
+                    // Check if the CPU halted because it reached our exit SVC
+                    if (halt == Dynarmic::HaltReason::UserDefined1 && 
+                        thread_cpu.Regs()[15] == (loader.GetThunk("pthread_exit") & ~1)) {
+                        break; // Clean exit!
+                    }
+    
+                    if (halt == Dynarmic::HaltReason::UserDefined2) {
+                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    } 
+                }
+                
+                // Clean up memory after thread exit
+                memory.FreeHeap(sp - stack_size);
+                memory.FreeHeap(tls);
+                std::cout << "[Threading] Background thread exited gracefully." << std::endl;
+                
+            }).detach(); // Detach allows it to run freely alongside the main emulator thread!
+            
+            cpu->Regs()[0] = 0; // Success
+        });
+
+        ROUTE_REGISTER(router, "pthread_exit",[](Dynarmic::A32::Jit* cpu) {
+            // Safely break out of the CPU loop.
+            cpu->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+        });
+
+        ROUTE_REGISTER(router, "pthread_self", [](Dynarmic::A32::Jit* cpu) {
+            cpu->Regs()[0] = 1; // Return a dummy thread ID
+        });
+
+        ROUTE_REGISTER(router, "pthread_once", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t once_control_ptr = cpu->Regs()[0];
+            // Mark the control variable as "completed" (usually 2 in Bionic libc)
+            // This prevents the game from getting stuck in an infinite init loop
+            if (once_control_ptr != 0) memory.Write32(once_control_ptr, 2);
+            cpu->Regs()[0] = 0; // Success
+        });
+
+        ROUTE_REGISTER(router, "pthread_attr_init", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t attr = cpu->Regs()[0];
+            if (attr) {
+                for (int i = 0; i < 24; i++) memory.Write8(attr + i, 0);
+            }
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_mutex_lock",[](Dynarmic::A32::Jit* cpu) {
+            uint32_t mutex_ptr = cpu->Regs()[0];
+            std::shared_ptr<std::recursive_mutex> m;
+            {
+                std::lock_guard<std::mutex> lock(host_mutex_lock);
+                if (!host_mutexes[mutex_ptr]) host_mutexes[mutex_ptr] = std::make_shared<std::recursive_mutex>();
+                m = host_mutexes[mutex_ptr];
+            }
+            m->lock(); // Block natively!
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_mutex_unlock",[](Dynarmic::A32::Jit* cpu) {
+            uint32_t mutex_ptr = cpu->Regs()[0];
+            std::shared_ptr<std::recursive_mutex> m;
+            {
+                std::lock_guard<std::mutex> lock(host_mutex_lock);
+                m = host_mutexes[mutex_ptr];
+            }
+            if (m) m->unlock();
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_mutex_destroy",[](Dynarmic::A32::Jit* cpu) {
+            uint32_t mutex_ptr = cpu->Regs()[0];
+            std::lock_guard<std::mutex> lock(host_mutex_lock);
+            host_mutexes.erase(mutex_ptr);
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_cond_timedwait", [&memory](Dynarmic::A32::Jit* cpu) {
+            /*
+            uint32_t abstime_ptr = cpu->Regs()[2];
+
+            int64_t sleep_us = 1000; // hard minimum: always yield at least 1 ms
+
+            if (abstime_ptr) {
+                int32_t tv_sec  = static_cast<int32_t>(memory.Read32(abstime_ptr));
+                int32_t tv_nsec = static_cast<int32_t>(memory.Read32(abstime_ptr + 4));
+
+                // Use gettimeofday here too so we are guaranteed to match the guest
+                struct timeval now;
+                ::gettimeofday(&now, nullptr);
+                int64_t now_us    = static_cast<int64_t>(now.tv_sec) * 1000000LL + now.tv_usec;
+                int64_t abstime_us = static_cast<int64_t>(tv_sec) * 1000000LL + (tv_nsec / 1000LL);
+
+                int64_t diff = abstime_us - now_us;
+                if (diff > sleep_us) sleep_us = diff;
+                if (sleep_us > 50000) sleep_us = 50000; // cap at 50ms so we don't hang the emu
+            }
+
+            if (sleep_us > 0) {
+                usleep(static_cast<useconds_t>(sleep_us));
+            } */
+
+            cpu->Regs()[0] = ETIMEDOUT; // 110
+            cpu->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+        });
+
+
+    }
+
+}

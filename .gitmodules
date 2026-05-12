@@ -1,0 +1,3 @@
+[submodule "third-party/dynarmic"]
+	path = third-party/dynarmic
+	url = https://github.com/lioncash/dynarmic

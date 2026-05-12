@@ -1,0 +1,222 @@
+#pragma once
+#include "SyscallRouter.hpp"
+#include "GuestMemory.hpp"
+
+namespace HLE::Strings {
+
+    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
+
+        //TODO: strcasecmp, strncasecmp, strcpy, strncpy, strcat, strdup, strchr, strstr, strpbrk,
+        //      strcoll, strxfrm, strerror, sprintf, snprintf, vsnprintf, swprintf, sscanf, atol, strtol,
+        //      strtoul, strtoull, wcscoll, wcsxfrm, wcrtomb, mbrtowc, iswctype, tolower, towupper, setlocale
+
+        ROUTE_REGISTER(router, "strlen", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t ptr = cpu->Regs()[0];
+            bool is_xml = (0x55b9dbc0 != 0 && ptr >= 0x55b9dbc0 && ptr < (0x55b9dbc0 + 0x223b));
+    
+            uint32_t len = 0;
+            // Safely compute length (limit to 1MB to avoid hangs)
+            while (len < 1024*1024 && memory.Read8(ptr + len) != '\0') {
+                len++;
+            }
+    
+            if (is_xml) {
+                uint32_t offset = ptr - 0x55b9dbc0;
+                uint32_t remaining = (0x55b9dbc0 + 0x223b) - ptr;
+                std::cout << "[strlen] XML buffer: ptr=0x" << std::hex << ptr
+                          << " offset=" << std::dec << offset
+                          << " len=" << len
+                          << " (remaining=" << remaining << ")"
+                          << (len > remaining ? " *** OVERRUN ***" : "")
+                          << std::endl;
+                // Dump first 16 bytes at ptr
+                std::cout << "  Data: ";
+                for (int i = 0; i < 16; i++) {
+                    uint8_t b = memory.Read8(ptr + i);
+                    if (b >= 32 && b <= 126) std::cout << (char)b;
+                    else printf("[%02X]", b);
+                }
+                std::cout << std::endl;
+            }
+    
+            cpu->Regs()[0] = len;
+        });
+
+        ROUTE_REGISTER(router, "strcmp", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t s1 = cpu->Regs()[0];
+            uint32_t s2 = cpu->Regs()[1];
+            const char* str1 = reinterpret_cast<const char*>(memory.GetHostPointer(s1));
+            const char* str2 = reinterpret_cast<const char*>(memory.GetHostPointer(s2));
+            /*
+            std::cout << "[Router] strcmp: comparing '" << (str1 ? str1 : "(null)") 
+              << "' with '" << (str2 ? str2 : "(null)") << "'" << std::endl;
+            */
+            cpu->Regs()[0] = std::strcmp(str1, str2);
+        });
+
+        ROUTE_REGISTER(router, "strncmp", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t s1 = cpu->Regs()[0];
+            uint32_t s2 = cpu->Regs()[1];
+            uint32_t n = cpu->Regs()[2];
+
+            /*
+            std::cout << "-------^ strncmp ^-------" << std::endl;
+            std::cout << "R0 (This): 0x" << std::hex << cpu->Regs()[0] << std::dec << std::endl;
+            std::cout << "R1: 0x" << std::hex << cpu->Regs()[1] << std::dec << std::endl;
+            std::cout << "R2: 0x" << std::hex << cpu->Regs()[2] << std::dec << std::endl;
+            std::cout << "R3: 0x" << std::hex << cpu->Regs()[3] << std::dec << std::endl;
+            std::cout << "SP: 0x" << std::hex << cpu->Regs()[13] << std::dec << std::endl;
+            std::cout << "CPSR:0x" << std::hex << cpu->Cpsr() << std::dec << std::endl;
+            std::cout << "LR (R14) : 0x" << std::hex << cpu->Regs()[14] << std::dec << std::endl;
+            std::cout << "PC (R15) : 0x" << std::hex << cpu->Regs()[15] << std::dec << std::endl;
+            std::cout << "-------------------------" << std::endl;
+            */
+
+            /*
+            if (cpu->Regs()[1] == 0x4052b230 && cpu->Regs()[2] == 0x1) {
+                uint8_t byte = memory.Read8(cpu->Regs()[0]);
+                printf("strncmp: comparing byte at 0x%08x = 0x%02x ('%c') with '<'\n",
+                       cpu->Regs()[0], byte, isprint(byte) ? byte : '.');
+                // Also dump a few surrounding bytes
+                printf("Surrounding: ");
+                for (int i = -4; i <= 4; i++) {
+                    uint8_t b = memory.Read8(cpu->Regs()[0] + i);
+                    printf("%02x ", b);
+                }
+                printf("\n");
+            }
+            */
+
+            int result = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                uint8_t c1 = memory.Read8(s1 + i);
+                uint8_t c2 = memory.Read8(s2 + i);
+                if (c1 != c2 || c1 == '\0') {
+                    result = c1 - c2;
+                    break;
+                }
+            }
+            cpu->Regs()[0] = result;
+        });
+
+        ROUTE_REGISTER(router, "strrchr", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t ptr = cpu->Regs()[0];
+            int ch = cpu->Regs()[1];
+            
+            const char* str = reinterpret_cast<const char*>(memory.GetHostPointer(ptr));
+            const char* res = std::strrchr(str, ch);
+            
+            if (res) cpu->Regs()[0] = ptr + (res - str);
+            else cpu->Regs()[0] = 0;
+        });
+
+
+        ROUTE_REGISTER(router, "vsprintf", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t str_ptr = cpu->Regs()[0];
+            uint32_t fmt_ptr = cpu->Regs()[1];
+            uint32_t ap = cpu->Regs()[2]; // va_list pointer
+
+            std::string format = reinterpret_cast<const char*>(memory.GetHostPointer(fmt_ptr));
+            char* out_str = reinterpret_cast<char*>(memory.GetHostPointer(str_ptr));
+            
+            std::string result = "";
+            for (size_t i = 0; i < format.length(); i++) {
+                if (format[i] == '%' && i + 1 < format.length()) {
+                    i++;
+                    if (format[i] == 'd' || format[i] == 'i') {
+                        int val = memory.Read32(ap); ap += 4;
+                        result += std::to_string(val);
+                    } else if (format[i] == 's') {
+                        uint32_t ptr = memory.Read32(ap); ap += 4;
+                        if (ptr) result += reinterpret_cast<const char*>(memory.GetHostPointer(ptr));
+                        else result += "(null)";
+                    } else if (format[i] == 'f') {
+                        // Floats are promoted to 8-byte doubles in varargs, and must be 8-byte aligned!
+                        if (ap % 8 != 0) ap += 4; 
+                        uint64_t val = memory.Read64(ap); ap += 8;
+                        double d; std::memcpy(&d, &val, sizeof(double));
+                        result += std::to_string(d);
+                    } else if (format[i] == 'x' || format[i] == 'X') {
+                        int val = memory.Read32(ap); ap += 4;
+                        char buf[16]; snprintf(buf, sizeof(buf), format[i] == 'x' ? "%x" : "%X", val);
+                        result += buf;
+                    } else {
+                        result += format[i]; // Unhandled tag, just print it raw
+                    }
+                } else {
+                    result += format[i];
+                }
+            }
+            
+            std::strcpy(out_str, result.c_str());
+            cpu->Regs()[0] = result.length();
+        });
+
+        ROUTE_REGISTER(router, "atoi", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t str_ptr = cpu->Regs()[0];
+            if (str_ptr != 0) {
+                std::string str = reinterpret_cast<const char*>(memory.GetHostPointer(str_ptr));
+                cpu->Regs()[0] = std::atoi(str.c_str());
+            } else {
+                cpu->Regs()[0] = 0;
+            }
+        });
+
+        ROUTE_REGISTER(router, "strtod", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t nptr        = cpu->Regs()[0];
+            uint32_t endptr_ptr  = cpu->Regs()[1];
+
+            // Safely map the guest string; if null, feed an empty string to strtod
+            const char* host_str = "";
+            if (nptr) {
+                host_str = reinterpret_cast<const char*>(memory.GetHostPointer(nptr));
+            }
+
+            // Call host strtod
+            char* host_end = nullptr;
+            double result = std::strtod(host_str, &host_end);
+
+            // Write back the guest address of the first invalid character if endptr was provided
+            if (endptr_ptr) {
+                if (nptr && host_end) {
+                    uint32_t end_guest = nptr + static_cast<uint32_t>(host_end - host_str);
+                    memory.Write32(endptr_ptr, end_guest);
+                } else {
+                    memory.Write32(endptr_ptr, 0);
+                }
+            }
+
+            // Return raw double bits in R0:R1 (ARM 32-bit softfp/soft-float ABI)
+            uint64_t raw;
+            std::memcpy(&raw, &result, sizeof(double));
+            cpu->Regs()[0] = static_cast<uint32_t>(raw & 0xFFFFFFFF);
+            cpu->Regs()[1] = static_cast<uint32_t>(raw >> 32);
+        });
+
+        ROUTE_REGISTER(router, "wcslen", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t str_ptr = cpu->Regs()[0];
+            const wchar_t* str = reinterpret_cast<const wchar_t*>(memory.GetHostPointer(str_ptr));
+            cpu->Regs()[0] = std::wcslen(str);
+        });
+
+        ROUTE_REGISTER(router, "wctob", [](Dynarmic::A32::Jit* cpu) {
+            uint32_t c = cpu->Regs()[0];
+            cpu->Regs()[0] = (c < 128) ? c : -1; // -1 is EOF
+        });
+
+        ROUTE_REGISTER(router, "btowc", [](Dynarmic::A32::Jit* cpu) {
+            uint32_t c = cpu->Regs()[0];
+            cpu->Regs()[0] = (c != (uint32_t)-1) ? c : -1; // WEOF
+        });
+
+        ROUTE_REGISTER(router, "wctype", [](Dynarmic::A32::Jit* cpu) {
+            cpu->Regs()[0] = 1; // Return a valid property ID
+        });
+
+        ROUTE_REGISTER(router, "towlower", [](Dynarmic::A32::Jit* cpu) {
+            uint32_t c = cpu->Regs()[0];
+            cpu->Regs()[0] = (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+        });
+
+    }
+}
