@@ -83,3 +83,6 @@ func_list.txt
 Linnaria
 linnaria
 bar.sh
+
+## submodule clone (Dynarmic — see BUILD.md)
+third-party/
