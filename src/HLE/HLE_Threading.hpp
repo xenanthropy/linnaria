@@ -107,10 +107,16 @@ namespace HLE::Threading {
                         break; // Clean exit
                     }
 
+                    if (halt == Dynarmic::HaltReason::UserDefined1) {
+                        // Some other UserDefined1 (e.g. Emulator_Return_Trap fired
+                        // from a nested call site). Clear and continue so we don't
+                        // leave the halt latched.
+                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
+                    }
+
                     if (halt == Dynarmic::HaltReason::UserDefined2) {
                         thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        continue;
                     }
 
                     if (halt == Dynarmic::HaltReason::UserDefined3) {
@@ -121,23 +127,12 @@ namespace HLE::Threading {
                             thread_cpu.SetCpsr(once_saved_state.cpsr);
                             once_saved_state.valid = false;
                         }
-                        continue;
                     }
 
-                    if (halt == Dynarmic::HaltReason::UserDefined1) {
-                        // UserDefined1 but PC != pthread_exit thunk — guest function
-                        // returned via Emulator_Return_Trap on a worker. Clear and
-                        // continue so we don't wedge the loop forever.
-                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
-                        continue;
-                    }
-
-                    // Unexpected halt reason — log and break to avoid an infinite spin.
-                    std::lock_guard<std::mutex> lock(console_mutex);
-                    std::cerr << "[Threading] Worker " << core_id
-                              << " unexpected halt_reason=0x" << std::hex
-                              << static_cast<uint64_t>(halt) << std::dec << "; exiting." << std::endl;
-                    break;
+                    // Any other halt reason (including halt_reason=0, which just
+                    // means Dynarmic ran out of its tick budget from
+                    // GetTicksRemaining()) is implicitly handled by looping back
+                    // around and re-entering Run().
                 }
 
                 // Unregister stack range BEFORE the FreeHeap so a racing AllocateHeap
