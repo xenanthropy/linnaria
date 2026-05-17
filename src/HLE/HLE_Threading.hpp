@@ -5,6 +5,7 @@
 #include "EmuCallbacks.hpp"
 #include "AndroidCP15.hpp"
 #include "ThreadingHelpers.hpp"
+#include "Watchpoint.hpp"
 
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <thread>
@@ -46,58 +47,70 @@ namespace HLE::Threading {
             uint32_t entry = cpu->Regs()[2];
             uint32_t arg = cpu->Regs()[3];
             
-            // Allocate a unique Stack and TLS area for the new thread
-            uint32_t stack_size = 1024 * 1024; 
-            uint32_t sp = memory.AllocateHeap(stack_size) + stack_size;
-            uint32_t tls = memory.AllocateHeap(4096);
-            
+            // Allocate a unique Stack and TLS area for the new thread.
+            // Pass the guest LR as caller_pc so the AllocDump can identify the spawn site.
+            uint32_t stack_size = 1024 * 1024;
+            uint32_t stack_base = memory.AllocateHeap(stack_size, cpu->Regs()[14]);
+            uint32_t sp = stack_base + stack_size;
+            uint32_t tls = memory.AllocateHeap(4096, cpu->Regs()[14]);
+
             static std::atomic<int> next_core_id{1};
             int core_id = next_core_id.fetch_add(1);
-            
+
             if (thread_ptr) memory.Write32(thread_ptr, core_id);
-            
+
             // Fire off the background thread
-            std::thread([&memory, &loader, &router, &monitor, entry, arg, sp, tls, core_id, stack_size]() {
-                
+            std::thread([&memory, &loader, &router, &monitor, entry, arg, sp, stack_base, tls, core_id, stack_size]() {
+
+                // Register this thread's stack range so any cross-thread write
+                // into it (or any AllocateHeap that returns an overlapping block)
+                // gets caught immediately. Owner is *this* host thread.
+                Watchpoint::Add(stack_base, stack_base + stack_size, "worker_stack");
+
                 // Each thread gets its own callback handler pointing to its own CPU
                 EmuCallbacks callbacks(memory, loader, router);
-                
+
                 Dynarmic::A32::UserConfig config;
                 config.callbacks = &callbacks;
                 config.page_table = &memory.page_table;
                 config.absolute_offset_page_table = false;
-                config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
+                /* DEBUG: disable fastmem_pointer on workers so MemoryWrite* callbacks
+                   actually fire and the cross-thread watchpoint can trip. Match the
+                   main thread's debug toggle in main.cpp:212. */
+                //config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
+                config.fastmem_pointer = 0;
                 config.recompile_on_fastmem_failure = true;
                 config.arch_version = Dynarmic::A32::ArchVersion::v7;
-                
+
                 // Share the global monitor, give thread a unique ID and its own CP15/TLS
                 config.global_monitor = &monitor;
                 config.processor_id = core_id;
                 config.coprocessors[15] = std::make_shared<AndroidCP15>(tls);
-                
+
                 Dynarmic::A32::Jit thread_cpu(config);
                 callbacks.cpu = &thread_cpu;
-                
+
                 // Setup initial Registers
                 thread_cpu.Regs()[13] = sp;
                 thread_cpu.Regs()[0] = arg;
                 thread_cpu.Regs()[14] = loader.GetThunk("pthread_exit");
                 thread_cpu.Regs()[15] = entry & ~1;
                 thread_cpu.SetCpsr((entry & 1) ? 0x30 : 0x10);
-                
+
                 // Background Emulator Loop
                 while (true) {
                     auto halt = thread_cpu.Run();
 
                     // Check if the CPU halted because it reached our exit SVC
-                    if (halt == Dynarmic::HaltReason::UserDefined1 && 
+                    if (halt == Dynarmic::HaltReason::UserDefined1 &&
                         thread_cpu.Regs()[15] == (loader.GetThunk("pthread_exit") & ~1)) {
                         break; // Clean exit
                     }
-    
+
                     if (halt == Dynarmic::HaltReason::UserDefined2) {
                         thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
                     }
 
                     if (halt == Dynarmic::HaltReason::UserDefined3) {
@@ -108,14 +121,35 @@ namespace HLE::Threading {
                             thread_cpu.SetCpsr(once_saved_state.cpsr);
                             once_saved_state.valid = false;
                         }
+                        continue;
                     }
+
+                    if (halt == Dynarmic::HaltReason::UserDefined1) {
+                        // UserDefined1 but PC != pthread_exit thunk — guest function
+                        // returned via Emulator_Return_Trap on a worker. Clear and
+                        // continue so we don't wedge the loop forever.
+                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
+                        continue;
+                    }
+
+                    // Unexpected halt reason — log and break to avoid an infinite spin.
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cerr << "[Threading] Worker " << core_id
+                              << " unexpected halt_reason=0x" << std::hex
+                              << static_cast<uint64_t>(halt) << std::dec << "; exiting." << std::endl;
+                    break;
                 }
-                
+
+                // Unregister stack range BEFORE the FreeHeap so a racing AllocateHeap
+                // on another thread can't be flagged as overlapping a stack that is
+                // already on its way out.
+                Watchpoint::Remove(stack_base);
+
                 // Clean up memory after thread exit
-                memory.FreeHeap(sp - stack_size);
+                memory.FreeHeap(stack_base);
                 memory.FreeHeap(tls);
                 std::cout << "[Threading] Background thread exited gracefully." << std::endl;
-                
+
             }).detach(); // Detach allows it to run freely alongside the main threads
             
             cpu->Regs()[0] = 0; // Success

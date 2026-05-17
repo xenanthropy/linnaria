@@ -74,16 +74,19 @@ namespace HLE::Android {
             }
 
             auto& asset = host_assets.open_files[asset_ptr];
-            
+
             std::vector<char> temp_buf(count);
             asset.file.read(temp_buf.data(), count);
             uint32_t bytes_read = asset.file.gcount();
 
+            if (bytes_read > 0) {
+                memory.CheckBoundedWrite(buffer_ptr, bytes_read, "AAsset_read", cpu->Regs()[14]);
+            }
             for (uint32_t i = 0; i < bytes_read; i++) {
                 memory.Write8(buffer_ptr + i, temp_buf[i]);
             }
 
-            cpu->Regs()[0] = bytes_read; 
+            cpu->Regs()[0] = bytes_read;
         });
 
         ROUTE_REGISTER(router, "AAsset_close", [](Dynarmic::A32::Jit* cpu) {

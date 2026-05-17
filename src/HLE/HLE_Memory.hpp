@@ -11,7 +11,7 @@ namespace HLE::Memory {
         
         ROUTE_REGISTER(router, "malloc", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t size = cpu->Regs()[0];
-            cpu->Regs()[0] = memory.AllocateHeap(size);
+            cpu->Regs()[0] = memory.AllocateHeap(size, cpu->Regs()[14]);
         });
 
         ROUTE_REGISTER(router, "calloc", [&memory](Dynarmic::A32::Jit* cpu) {
@@ -19,13 +19,13 @@ namespace HLE::Memory {
             uint32_t size  = cpu->Regs()[1];
             uint32_t total = nmemb * size;
             if (total == 0) total = 1;
-            uint32_t ptr = memory.AllocateHeap(total);
+            uint32_t ptr = memory.AllocateHeap(total, cpu->Regs()[14]);
             std::memset(memory.GetHostPointer(ptr), 0, total);
             cpu->Regs()[0] = ptr;
         });
 
         ROUTE_REGISTER(router, "realloc", [&memory](Dynarmic::A32::Jit* cpu) {
-            cpu->Regs()[0] = memory.ReallocHeap(cpu->Regs()[0], cpu->Regs()[1]);
+            cpu->Regs()[0] = memory.ReallocHeap(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[14]);
         });
 
 
@@ -39,6 +39,7 @@ namespace HLE::Memory {
             uint32_t n    = cpu->Regs()[2];
 
             if (n > 0) {
+                memory.CheckBoundedWrite(dest, n, "memcpy", cpu->Regs()[14]);
                 std::memcpy(memory.GetHostPointer(dest), memory.GetHostPointer(src), n);
             }
 
@@ -50,6 +51,8 @@ namespace HLE::Memory {
             uint8_t val = static_cast<uint8_t>(cpu->Regs()[1]);
             uint32_t count = cpu->Regs()[2];
 
+            if (count > 0) memory.CheckBoundedWrite(dest, count, "memset", cpu->Regs()[14]);
+
             for (uint32_t i = 0; i < count; i++) {
                 memory.Write8(dest + i, val);
             }
@@ -60,9 +63,11 @@ namespace HLE::Memory {
             uint32_t dest = cpu->Regs()[0];
             uint32_t src = cpu->Regs()[1];
             uint32_t count = cpu->Regs()[2];
-            
+
+            if (count > 0) memory.CheckBoundedWrite(dest, count, "memmove", cpu->Regs()[14]);
+
             std::memmove(memory.GetHostPointer(dest), memory.GetHostPointer(src), count);
-            
+
             cpu->Regs()[0] = dest; // memmove returns the destination pointer
         });
 

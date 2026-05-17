@@ -19,13 +19,17 @@ public:
         PrintOOBMemoryRead(vaddr, "(MemoryRead8)");
         return *mem.GetHostPointer(vaddr);
     }
-    void MemoryWrite8(uint32_t vaddr, uint8_t value) override { *mem.GetHostPointer(vaddr) = value; }
+    void MemoryWrite8(uint32_t vaddr, uint8_t value) override {
+        CheckCrossThreadWrite(vaddr, 1, value);
+        *mem.GetHostPointer(vaddr) = value;
+    }
 
     uint16_t MemoryRead16(uint32_t vaddr) override {
         PrintOOBMemoryRead(vaddr, "(MemoryRead16)");
         return MemoryRead8(vaddr) | (uint16_t(MemoryRead8(vaddr + 1)) << 8);
     }
     void MemoryWrite16(uint32_t vaddr, uint16_t value) override {
+        CheckCrossThreadWrite(vaddr, 2, value);
         MemoryWrite8(vaddr,     value & 0xFF);
         MemoryWrite8(vaddr + 1, (value >> 8) & 0xFF);
     }
@@ -34,15 +38,52 @@ public:
         PrintOOBMemoryRead(vaddr, "(MemoryRead32)");
         return mem.Read32(vaddr);
     }
-    void MemoryWrite32(uint32_t vaddr, uint32_t value)  override { mem.Write32(vaddr, value); }
+    void MemoryWrite32(uint32_t vaddr, uint32_t value)  override {
+        CheckCrossThreadWrite(vaddr, 4, value);
+        mem.Write32(vaddr, value);
+    }
 
     uint64_t MemoryRead64(uint32_t vaddr)  override {
         PrintOOBMemoryRead(vaddr, "(MemoryRead64)");
         return uint64_t(MemoryRead32(vaddr)) | (uint64_t(MemoryRead32(vaddr + 4)) << 32);
     }
     void MemoryWrite64(uint32_t vaddr, uint64_t value) override {
+        CheckCrossThreadWrite(vaddr, 8, value);
         MemoryWrite32(vaddr,     uint32_t(value));
         MemoryWrite32(vaddr + 4, uint32_t(value >> 32));
+    }
+
+    // If a guest write hits a watched range owned by a different host thread,
+    // dump full CPU state + the allocation map and exit. This is the moment
+    // we want to catch the heap-vs-stack aliasing bug.
+    void CheckCrossThreadWrite(uint32_t vaddr, uint32_t size, uint64_t value) {
+        auto hit = Watchpoint::Find(vaddr, size);
+        if (!hit) return;
+        if (hit->owner == std::this_thread::get_id()) return;
+
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "\n[Watchpoint] CROSS-THREAD WRITE caught!\n"
+                  << "  vaddr=0x" << std::hex << vaddr << " size=" << std::dec << size
+                  << " value=0x" << std::hex << value << std::dec << "\n"
+                  << "  range: [0x" << std::hex << hit->lo << ", 0x" << hit->hi
+                  << ") tag='" << (hit->tag ? hit->tag : "?")
+                  << "' owner=" << Watchpoint::TidString(hit->owner)
+                  << " current_tid=" << Watchpoint::TidString(std::this_thread::get_id())
+                  << std::dec << "\n";
+        DumpCpuState();
+        mem.DumpAllocationsNear(vaddr);
+        std::exit(1);
+    }
+
+    void DumpCpuState() {
+        if (!cpu) return;
+        for (int i = 0; i < 13; i++) {
+            std::cout << "  R" << i << " = 0x" << std::hex << cpu->Regs()[i] << std::dec << "\n";
+        }
+        std::cout << "  SP   = 0x" << std::hex << cpu->Regs()[13] << "\n"
+                  << "  LR   = 0x" << cpu->Regs()[14] << "\n"
+                  << "  PC   = 0x" << cpu->Regs()[15] << "\n"
+                  << "  CPSR = 0x" << cpu->Cpsr() << std::dec << "\n";
     }
 
     std::optional<uint32_t> MemoryReadCode(uint32_t vaddr) override {
@@ -56,39 +97,29 @@ public:
     }
 
     void PrintOOBMemoryRead(uint32_t vaddr, std::string funcName) {
-        if (vaddr < 0x40000000) {
-            std::lock_guard<std::mutex> lock(console_mutex);
-            std::cout << "\n[CRASH TRAP] Caught OOB reading " << funcName <<  " 0x" << std::hex << vaddr << std::dec << "!" << std::endl;
-            if (cpu) {
-                std::cout << "R0 (This): 0x" << std::hex << cpu->Regs()[0] << std::dec << std::endl;
-                std::cout << "R1: 0x" << std::hex << cpu->Regs()[1] << std::dec << std::endl;
-                std::cout << "R2: 0x" << std::hex << cpu->Regs()[2] << std::dec << std::endl;
-                std::cout << "R3: 0x" << std::hex << cpu->Regs()[3] << std::dec << std::endl;
-                std::cout << "SP: 0x" << std::hex << cpu->Regs()[13] << std::dec << std::endl;
-                std::cout << "CPSR:0x" << std::hex << cpu->Cpsr() << std::dec << std::endl;
-                std::cout << "LR (R14) : 0x" << std::hex << cpu->Regs()[14] << std::dec << std::endl;
-                std::cout << "PC (R15) : 0x" << std::hex << cpu->Regs()[15] << std::dec << std::endl;
-            }
-            // Violently kill the emulator before it can slide!
-            std::exit(1);
-        }
+        bool is_oob = (vaddr < 0x40000000) ||
+                      (vaddr == 0xfffffff4 || vaddr == 0xfffffff8 || vaddr == 0xfffffffc);
+        if (!is_oob) return;
 
-        if (vaddr == 0xfffffff4 || vaddr == 0xfffffff8 || vaddr == 0xfffffffc) {
-            std::lock_guard<std::mutex> lock(console_mutex);
-            std::cout << "\n[CRASH TRAP] Caught OOB reading " << funcName << " 0x" << std::hex << vaddr << std::dec << "!" << std::endl;
-            if (cpu) {
-                std::cout << "R0 (This): 0x" << std::hex << cpu->Regs()[0] << std::dec << std::endl;
-                std::cout << "R1: 0x" << std::hex << cpu->Regs()[1] << std::dec << std::endl;
-                std::cout << "R2: 0x" << std::hex << cpu->Regs()[2] << std::dec << std::endl;
-                std::cout << "R3: 0x" << std::hex << cpu->Regs()[3] << std::dec << std::endl;
-                std::cout << "SP: 0x" << std::hex << cpu->Regs()[13] << std::dec << std::endl;
-                std::cout << "CPSR:0x" << std::hex << cpu->Cpsr() << std::dec << std::endl;
-                std::cout << "LR (R14) : 0x" << std::hex << cpu->Regs()[14] << std::dec << std::endl;
-                std::cout << "PC (R15) : 0x" << std::hex << cpu->Regs()[15] << std::dec << std::endl;                
-            }
-            // Violently kill the emulator before it can slide!
-            std::exit(1);
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "\n[CRASH TRAP] Caught OOB reading " << funcName <<  " 0x"
+                  << std::hex << vaddr << std::dec << "!" << std::endl;
+        if (cpu) {
+            std::cout << "R0 (This): 0x" << std::hex << cpu->Regs()[0] << std::dec << std::endl;
+            std::cout << "R1: 0x" << std::hex << cpu->Regs()[1] << std::dec << std::endl;
+            std::cout << "R2: 0x" << std::hex << cpu->Regs()[2] << std::dec << std::endl;
+            std::cout << "R3: 0x" << std::hex << cpu->Regs()[3] << std::dec << std::endl;
+            std::cout << "SP: 0x" << std::hex << cpu->Regs()[13] << std::dec << std::endl;
+            std::cout << "CPSR:0x" << std::hex << cpu->Cpsr() << std::dec << std::endl;
+            std::cout << "LR (R14) : 0x" << std::hex << cpu->Regs()[14] << std::dec << std::endl;
+            std::cout << "PC (R15) : 0x" << std::hex << cpu->Regs()[15] << std::dec << std::endl;
+            std::cout << "host_tid=" << Watchpoint::TidString(std::this_thread::get_id()) << std::endl;
+            // Dump allocations + watched ranges around the crashing SP so we can see
+            // whether the live stack frame at SP overlaps any tracked heap block.
+            mem.DumpAllocationsNear(cpu->Regs()[13]);
         }
+        // Violently kill the emulator before it can slide!
+        std::exit(1);
     }
 
     void CallSVC(uint32_t swi) override {

@@ -11,6 +11,7 @@
 #include "AndroidCP15.hpp"
 #include "AndroidEnvironment.hpp"
 #include "ThreadingHelpers.hpp"
+#include "Watchpoint.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -225,6 +226,14 @@ int main(int argc, char** argv) {
         
         Dynarmic::A32::Jit cpu(config);
         callbacks.cpu = &cpu;
+
+        // Register the main thread's guest stack range. The main JIT's initial SP
+        // is GuestMemory::CODE_BASE + MEMORY_SIZE - 0x100000 (0x7FFF0000) and grows
+        // down. We conservatively claim the top 2 MiB. Owner is captured as the
+        // current (main) host thread id.
+        constexpr uint32_t MAIN_STACK_TOP  = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE;
+        constexpr uint32_t MAIN_STACK_SIZE = 2 * 1024 * 1024;
+        Watchpoint::Add(MAIN_STACK_TOP - MAIN_STACK_SIZE, MAIN_STACK_TOP, "main_stack");
 
         // Run C++ global constructors (init_array) before anything else
         for (uint32_t ctor : loader.GetConstructors()) {

@@ -12,6 +12,11 @@
 #include <map>
 #include <unordered_map>
 #include <mutex>
+#include <optional>
+#include <thread>
+#include <algorithm>
+
+#include "Watchpoint.hpp"
 
 class GuestMemory {
 public:
@@ -26,9 +31,15 @@ public:
 
     uint32_t current_heap_ptr = CODE_BASE + 0x10000000;
     std::mutex allocator_mutex;
-    
-    std::map<uint32_t, uint32_t> free_blocks;           // Address -> Size
-    std::unordered_map<uint32_t, uint32_t> allocations; // Address -> Size
+
+    struct AllocInfo {
+        uint32_t size;
+        uint32_t caller_pc;   // guest LR at allocation time (0 if unknown)
+        std::thread::id tid;  // host thread that performed the allocation
+    };
+
+    std::map<uint32_t, uint32_t>   free_blocks;  // Address -> Size
+    std::map<uint32_t, AllocInfo>  allocations;  // Address -> AllocInfo (sorted for range lookup)
 
     GuestMemory() {
         // Reserve 4GB virtual address space
@@ -132,38 +143,65 @@ public:
         Write32(vaddr + 4, static_cast<uint32_t>(value >> 32));
     }
 
-    uint32_t AllocateHeap(uint32_t size) {
+    uint32_t AllocateHeap(uint32_t size, uint32_t caller_pc = 0) {
         if (size == 0) size = 8;
         if (size % 8 != 0) size += 8 - (size % 8); // Align to 8 bytes
 
-        std::lock_guard<std::mutex> lock(allocator_mutex);
+        uint32_t addr;
+        uint32_t alloc_size;
+        {
+            std::lock_guard<std::mutex> lock(allocator_mutex);
 
-        // Search for a free block that fits (First-Fit)
-        for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
-            if (it->second >= size) {
-                uint32_t addr = it->first;
-                uint32_t block_size = it->second;
-                free_blocks.erase(it);
+            // Search for a free block that fits (First-Fit)
+            bool from_free_list = false;
+            for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
+                if (it->second >= size) {
+                    addr = it->first;
+                    uint32_t block_size = it->second;
+                    free_blocks.erase(it);
 
-                // Split block if there's enough leftover space
-                if (block_size > size + 8) {
-                    free_blocks[addr + size] = block_size - size;
-                    allocations[addr] = size;
-                } else {
-                    allocations[addr] = block_size;
+                    // Split block if there's enough leftover space
+                    if (block_size > size + 8) {
+                        free_blocks[addr + size] = block_size - size;
+                        alloc_size = size;
+                    } else {
+                        alloc_size = block_size;
+                    }
+                    allocations[addr] = {alloc_size, caller_pc, std::this_thread::get_id()};
+                    from_free_list = true;
+                    break;
                 }
-                return addr;
+            }
+
+            if (!from_free_list) {
+                // Fallback to Bump Allocator if no free blocks are large enough
+                addr = current_heap_ptr;
+                current_heap_ptr += size;
+                if (current_heap_ptr >= CODE_BASE + MEMORY_SIZE) {
+                    throw std::runtime_error("Guest Heap Out of Memory!");
+                }
+                alloc_size = size;
+                allocations[addr] = {alloc_size, caller_pc, std::this_thread::get_id()};
             }
         }
 
-        // Fallback to Bump Allocator if no free blocks are large enough
-        uint32_t ptr = current_heap_ptr;
-        current_heap_ptr += size;
-        if (current_heap_ptr >= CODE_BASE + MEMORY_SIZE) {
-            throw std::runtime_error("Guest Heap Out of Memory!");
+        // Diagnostic: if the returned block overlaps any registered stack range,
+        // we've handed out memory that aliases a live thread's stack. Catch it
+        // at the moment of corruption rather than at the eventual POP.
+        auto hit = Watchpoint::Find(addr, alloc_size);
+        if (hit) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "\n[AllocateHeap FATAL] Returned block [0x" << std::hex << addr
+                      << ", 0x" << (addr + alloc_size) << ") overlaps live watchpoint range ["
+                      << "0x" << hit->lo << ", 0x" << hit->hi << ") tag='"
+                      << (hit->tag ? hit->tag : "?") << "' owner=" << Watchpoint::TidString(hit->owner)
+                      << " caller_pc=0x" << caller_pc << std::dec
+                      << " current_tid=" << Watchpoint::TidString(std::this_thread::get_id()) << "\n";
+            DumpAllocationsNear(addr);
+            std::exit(1);
         }
-        allocations[ptr] = size;
-        return ptr;
+
+        return addr;
     }
 
     void FreeHeap(uint32_t ptr) {
@@ -172,14 +210,14 @@ public:
         std::lock_guard<std::mutex> lock(allocator_mutex);
         auto it = allocations.find(ptr);
         if (it != allocations.end()) {
-            uint32_t size = it->second;
+            uint32_t size = it->second.size;
             allocations.erase(it);
 
             free_blocks[ptr] = size;
 
             // Coalesce adjacent free blocks to prevent fragmentation
             auto current = free_blocks.find(ptr);
-            
+
             auto next = std::next(current); // Merge forward
             if (next != free_blocks.end() && current->first + current->second == next->first) {
                 current->second += next->second;
@@ -196,26 +234,139 @@ public:
         }
     }
 
-    uint32_t ReallocHeap(uint32_t ptr, uint32_t new_size) {
-        if (ptr == 0) return AllocateHeap(new_size);
+    uint32_t ReallocHeap(uint32_t ptr, uint32_t new_size, uint32_t caller_pc = 0) {
+        if (ptr == 0) return AllocateHeap(new_size, caller_pc);
         if (new_size == 0) { FreeHeap(ptr); return 0; }
-        
+
         allocator_mutex.lock();
         auto it = allocations.find(ptr);
         if (it == allocations.end()) {
             allocator_mutex.unlock();
             return 0; // Invalid pointer
         }
-        uint32_t old_size = it->second;
+        uint32_t old_size = it->second.size;
         allocator_mutex.unlock();
 
         if (old_size >= new_size) return ptr; // Lazy: keep existing if it's large enough
 
         // Reallocate, copy data, and free old block
-        uint32_t new_ptr = AllocateHeap(new_size);
+        uint32_t new_ptr = AllocateHeap(new_size, caller_pc);
         std::memcpy(GetHostPointer(new_ptr), GetHostPointer(ptr), old_size);
         FreeHeap(ptr);
         return new_ptr;
+    }
+
+    // Returns the AllocInfo for the live allocation containing `ptr`, or
+    // std::nullopt if `ptr` is not inside any tracked heap block.
+    struct AllocLookup {
+        uint32_t base;
+        uint32_t size;
+        uint32_t caller_pc;
+        std::thread::id tid;
+    };
+    std::optional<AllocLookup> FindAllocation(uint32_t ptr) {
+        std::lock_guard<std::mutex> lock(allocator_mutex);
+        auto it = allocations.upper_bound(ptr);
+        if (it == allocations.begin()) return std::nullopt;
+        --it;
+        if (ptr >= it->first && ptr < it->first + it->second.size) {
+            return AllocLookup{it->first, it->second.size, it->second.caller_pc, it->second.tid};
+        }
+        return std::nullopt;
+    }
+
+    // Bounds-check a bulk write of `n` bytes to `dest`. Fatal-on-fail per
+    // the user's "instrument fatal" preference. Two checks:
+    //   1) If `dest` lives inside a tracked allocation, the write must not
+    //      run past that allocation's end.
+    //   2) The range [dest, dest+n) must not overlap a watched stack range
+    //      owned by another host thread.
+    // The first writes-into-untracked-memory case (e.g. the main thread's
+    // stack at 0x7FFF0000, ELF .data, etc.) is silently allowed.
+    void CheckBoundedWrite(uint32_t dest, uint32_t n, const char* op, uint32_t caller_pc) {
+        if (n == 0) return;
+
+        auto info = FindAllocation(dest);
+        if (info) {
+            uint32_t alloc_end = info->base + info->size;
+            if (dest + n > alloc_end) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "\n[CheckBoundedWrite FATAL] " << op
+                          << " overruns allocation!\n"
+                          << "  dest=0x" << std::hex << dest
+                          << " n=" << std::dec << n
+                          << " caller_pc=0x" << std::hex << caller_pc << std::dec << "\n"
+                          << "  allocation: [0x" << std::hex << info->base << ", 0x"
+                          << alloc_end << ") size=" << std::dec << info->size
+                          << " alloc_caller_pc=0x" << std::hex << info->caller_pc << std::dec
+                          << " alloc_tid=" << Watchpoint::TidString(info->tid)
+                          << " current_tid=" << Watchpoint::TidString(std::this_thread::get_id())
+                          << "\n  overrun_by=" << (dest + n - alloc_end) << " bytes\n";
+                DumpAllocationsNear(dest);
+                std::exit(1);
+            }
+        }
+
+        auto hit = Watchpoint::Find(dest, n);
+        if (hit && hit->owner != std::this_thread::get_id()) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "\n[CheckBoundedWrite FATAL] " << op
+                      << " writes into another thread's watched range!\n"
+                      << "  dest=0x" << std::hex << dest
+                      << " n=" << std::dec << n
+                      << " caller_pc=0x" << std::hex << caller_pc << std::dec << "\n"
+                      << "  range: [0x" << std::hex << hit->lo << ", 0x" << hit->hi
+                      << ") tag='" << (hit->tag ? hit->tag : "?")
+                      << "' owner=" << Watchpoint::TidString(hit->owner)
+                      << " current_tid=" << Watchpoint::TidString(std::this_thread::get_id())
+                      << std::dec << "\n";
+            DumpAllocationsNear(dest);
+            std::exit(1);
+        }
+    }
+
+    // Print the up to N live allocations whose base address is closest to
+    // `addr`, plus the registered watchpoint ranges. Called from crash traps.
+    void DumpAllocationsNear(uint32_t addr, size_t n = 8) {
+        std::vector<std::pair<uint32_t, AllocInfo>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(allocator_mutex);
+            snapshot.reserve(allocations.size());
+            for (auto& kv : allocations) snapshot.emplace_back(kv.first, kv.second);
+        }
+        std::sort(snapshot.begin(), snapshot.end(),
+                  [addr](const auto& a, const auto& b) {
+                      auto da = a.first > addr ? a.first - addr : addr - a.first;
+                      auto db = b.first > addr ? b.first - addr : addr - b.first;
+                      return da < db;
+                  });
+
+        std::cout << "[AllocDump] " << snapshot.size() << " live allocations, showing "
+                  << std::min(n, snapshot.size()) << " closest to 0x"
+                  << std::hex << addr << std::dec << ":\n";
+        for (size_t i = 0; i < std::min(n, snapshot.size()); i++) {
+            auto& [base, info] = snapshot[i];
+            std::cout << "  [0x" << std::hex << base << ", 0x" << (base + info.size)
+                      << ") size=" << std::dec << info.size
+                      << " caller_pc=0x" << std::hex << info.caller_pc << std::dec
+                      << " tid=" << Watchpoint::TidString(info.tid);
+            if (addr >= base && addr < base + info.size) {
+                std::cout << "   <-- CONTAINS 0x" << std::hex << addr << std::dec;
+            }
+            std::cout << "\n";
+        }
+
+        auto ranges = Watchpoint::Snapshot();
+        std::cout << "[AllocDump] " << ranges.size() << " watched ranges:\n";
+        for (auto& r : ranges) {
+            std::cout << "  [0x" << std::hex << r.lo << ", 0x" << r.hi << ") tag='"
+                      << (r.tag ? r.tag : "?") << "' owner="
+                      << Watchpoint::TidString(r.owner) << std::dec;
+            if (addr >= r.lo && addr < r.hi) {
+                std::cout << "   <-- CONTAINS 0x" << std::hex << addr << std::dec;
+            }
+            std::cout << "\n";
+        }
     }
 
     uint32_t AllocateCtypeArray() {

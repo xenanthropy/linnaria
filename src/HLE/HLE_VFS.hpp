@@ -37,7 +37,7 @@ namespace HLE::VFS {
 
             int fd = ::fileno(fp);
 
-            uint32_t guest_file = memory.AllocateHeap(256);
+            uint32_t guest_file = memory.AllocateHeap(256, cpu->Regs()[14]);
             uint16_t fd16 = static_cast<uint16_t>(fd);
 
             // Write fd as a short at every 2-byte aligned offset.
@@ -81,6 +81,10 @@ namespace HLE::VFS {
             std::lock_guard<std::mutex> lock(file_mutex);
 
             if (open_files.find(handle) != open_files.end() && ptr) {
+                uint64_t n = static_cast<uint64_t>(size) * nmemb;
+                if (n > 0 && n <= 0xFFFFFFFFull) {
+                    memory.CheckBoundedWrite(ptr, static_cast<uint32_t>(n), "fread", cpu->Regs()[14]);
+                }
                 void* host_ptr = memory.GetHostPointer(ptr);
                 cpu->Regs()[0] = std::fread(host_ptr, size, nmemb, open_files[handle]);
             } else {
@@ -215,6 +219,9 @@ namespace HLE::VFS {
                     size_t& pos = fake_file_pos[fd];
                     size_t remaining = content.size() - pos;
                     size_t to_copy = std::min(static_cast<size_t>(count), remaining);
+                    if (to_copy > 0) {
+                        memory.CheckBoundedWrite(buf, static_cast<uint32_t>(to_copy), "read(fake)", cpu->Regs()[14]);
+                    }
                     std::memcpy(memory.GetHostPointer(buf), content.data() + pos, to_copy);
                     pos += to_copy;
                     cpu->Regs()[0] = static_cast<uint32_t>(to_copy);
@@ -228,6 +235,7 @@ namespace HLE::VFS {
                 return;
             }
 
+            if (count > 0) memory.CheckBoundedWrite(buf, count, "read", cpu->Regs()[14]);
             void* host_buf = memory.GetHostPointer(buf);
             ssize_t ret = ::read(fd, host_buf, count);
             cpu->Regs()[0] = static_cast<uint32_t>(ret);
