@@ -27,8 +27,14 @@ pkg_check_modules(GLES2 REQUIRED IMPORTED_TARGET glesv2)
 add_executable(linnaria
     src/main.cpp
     src/ElfLoader.cpp
+    src/ThreadingHelpers.cpp
     glad/gles2.c
 )
+
+#target_compile_features(linnaria PRIVATE cxx_std_20)
+# ASAN
+#target_compile_options(linnaria PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g)
+#target_link_options(linnaria PRIVATE -fsanitize=thread)
 
 # 4. Link everything together
 target_include_directories(linnaria PRIVATE src glad .)

@@ -138,31 +138,6 @@ std::string ElfLoader::GetDynSymName(uint32_t sym_index) {
 
 uint32_t ElfLoader::ResolveOrThunk(const std::string& name) {
     // Special case: ctype arrays
-    /*
-    if (name == "_ctype_" || name == "__ctype_" || name == "__ctype_ptr__") {
-        if (ctype_array_ptr == 0) {
-            ctype_array_ptr = mem.AllocateCtypeArray();
-        }
-        return ctype_array_ptr;
-    }
-    */
-    /*
-    if (name == "_ctype_" || name == "__ctype_" || name == "__ctype_ptr__") {
-        if (ctype_array_ptr == 0) {
-            // 1. Allocate the 257-byte flag table (your existing array)
-            uint32_t table = mem.AllocateCtypeArray();
-
-            // 2. Allocate a 4-byte guest variable to act as "_ctype_" itself
-            uint32_t ptr_var = mem.AllocateHeap(4);
-            mem.Write32(ptr_var, table);
-
-            // 3. Return the ADDRESS OF THE POINTER VARIABLE, not the table
-            ctype_array_ptr = ptr_var;
-        }
-        return ctype_array_ptr;
-    } */
-
-    // Special case: ctype arrays
     if (name == "_ctype_" || name == "__ctype_" || name == "__ctype_ptr__") {
         // Ensure tables are allocated (idempotent)
         mem.AllocateCtypeArray();  // this will fill the three tables once
@@ -182,7 +157,71 @@ uint32_t ElfLoader::ResolveOrThunk(const std::string& name) {
         return mem.GetCtypeToupperAddr();
     }
 
-    // --- NEW: Stack Canary Data ---
+    // ───────────── 16‑bit tolower / toupper tables (used by Texture2D etc.) ─────────
+    if (name == "_tolower_tab_") {
+        // _tolower_tab_ is a pointer variable that holds the address of the 16‑bit table
+        static uint32_t tol_var = 0;
+        if (tol_var == 0) {
+            // Allocate and fill the 16‑bit table (257 shorts)
+            uint32_t table = mem.AllocateHeap(257 * sizeof(uint16_t));
+            uint16_t* tbl = reinterpret_cast<uint16_t*>(mem.GetHostPointer(table));
+            for (int i = 0; i < 257; ++i) {
+                int ch = i - 1;               // index 0 for EOF, 1 for char 0, etc.
+                if (ch >= 0 && ch <= 255) {
+                    tbl[i] = (ch >= 'A' && ch <= 'Z') ? (ch + 32) : ch;
+                } else {
+                    tbl[i] = 0;               // EOF / invalid
+                }
+            }
+            // Allocate the pointer variable and write the table address
+            tol_var = mem.AllocateHeap(4);
+            mem.Write32(tol_var, table);
+        }
+        return tol_var;
+    }
+
+    if (name == "_tolower_tab__ptr") {
+        // _tolower_tab__ptr is a pointer to the pointer variable _tolower_tab_
+        static uint32_t ptr_var = 0;
+        if (ptr_var == 0) {
+            // Make sure _tolower_tab_ is set up first
+            uint32_t tol_var = ResolveOrThunk("_tolower_tab_");
+            ptr_var = mem.AllocateHeap(4);
+            mem.Write32(ptr_var, tol_var);
+        }
+        return ptr_var;
+    }
+
+    // Toupper variants
+    if (name == "_toupper_tab_") {
+        static uint32_t toup_var = 0;
+        if (toup_var == 0) {
+            uint32_t table = mem.AllocateHeap(257 * sizeof(uint16_t));
+            uint16_t* tbl = reinterpret_cast<uint16_t*>(mem.GetHostPointer(table));
+            for (int i = 0; i < 257; ++i) {
+                int ch = i - 1;
+                if (ch >= 0 && ch <= 255) {
+                    tbl[i] = (ch >= 'a' && ch <= 'z') ? (ch - 32) : ch;
+                } else {
+                    tbl[i] = 0;
+                }
+            }
+            toup_var = mem.AllocateHeap(4);
+            mem.Write32(toup_var, table);
+        }
+        return toup_var;
+    }
+
+    if (name == "_toupper_tab__ptr") {
+        static uint32_t ptr_var = 0;
+        if (ptr_var == 0) {
+            uint32_t toup_var = ResolveOrThunk("_toupper_tab_");
+            ptr_var = mem.AllocateHeap(4);
+            mem.Write32(ptr_var, toup_var);
+        }
+        return ptr_var;
+    }
+
     if (name == "__stack_chk_guard") {
         static uint32_t guard_ptr = 0;
         if (guard_ptr == 0) {
@@ -192,7 +231,6 @@ uint32_t ElfLoader::ResolveOrThunk(const std::string& name) {
         return guard_ptr;
     }
 
-    // --- NEW: Standard Streams Data (__sF) ---
     // Android Bionic defines __sF as an array of 3 FILE structs (stdin, stdout, stderr).
     // An old Bionic FILE struct is about 84 bytes. We'll allocate 256 just to be safe.
     if (name == "__sF") {
@@ -201,6 +239,14 @@ uint32_t ElfLoader::ResolveOrThunk(const std::string& name) {
             sf_ptr = mem.AllocateHeap(256); 
         }
         return sf_ptr;
+    }
+
+    if (name == "pthread_once_done") {
+        static uint32_t once_done_addr = 0;
+        if (once_done_addr == 0) {
+            once_done_addr = EmitSVCThunk(0xFFFFFF); // special SVC ID
+        }
+        return once_done_addr;
     }
 
     if (name.empty()) return 0;
@@ -237,14 +283,6 @@ void ElfLoader::ApplyRel(const Elf32_Rel* rel, size_t count) {
                 std::string name = GetDynSymName(sym);
                 uint32_t tgt = ResolveLocal(sym);
                 if (!tgt) tgt = ResolveOrThunk(name);
-
-                // --- temporary debug ---
-                if (name.find("ctype") != std::string::npos) {
-                    std::cout << "[Reloc] " << name
-                              << " where=0x" << std::hex << where
-                              << " tgt=0x" << tgt << std::dec << std::endl;
-                }
-                // -----------------------
                 
                 mem.Write32(where, tgt);
                 break;

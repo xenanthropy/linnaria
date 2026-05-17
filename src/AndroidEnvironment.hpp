@@ -28,7 +28,7 @@ class AndroidEnvironment {
 public:
     static void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor) {
         
-        HLE::OS::RegisterAll(router, memory);
+        HLE::OS::RegisterAll(router, memory, loader);
         HLE::Memory::RegisterAll(router, memory);
         HLE::Strings::RegisterAll(router, memory);
         HLE::VFS::RegisterAll(router, memory);

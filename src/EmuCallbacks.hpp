@@ -7,6 +7,8 @@
 #include "SyscallRouter.hpp"
 #include <mutex>
 
+#include "Watchpoint.hpp"
+
 class EmuCallbacks : public Dynarmic::A32::UserCallbacks {
 public:
     EmuCallbacks(GuestMemory& mem, ElfLoader& loader, SyscallRouter& router)
@@ -17,7 +19,7 @@ public:
         PrintOOBMemoryRead(vaddr, "(MemoryRead8)");
         return *mem.GetHostPointer(vaddr);
     }
-    void     MemoryWrite8(uint32_t vaddr, uint8_t value) override { *mem.GetHostPointer(vaddr) = value; }
+    void MemoryWrite8(uint32_t vaddr, uint8_t value) override { *mem.GetHostPointer(vaddr) = value; }
 
     uint16_t MemoryRead16(uint32_t vaddr) override {
         PrintOOBMemoryRead(vaddr, "(MemoryRead16)");
@@ -32,7 +34,6 @@ public:
         PrintOOBMemoryRead(vaddr, "(MemoryRead32)");
         return mem.Read32(vaddr);
     }
-
     void MemoryWrite32(uint32_t vaddr, uint32_t value)  override { mem.Write32(vaddr, value); }
 
     uint64_t MemoryRead64(uint32_t vaddr)  override {
@@ -55,7 +56,7 @@ public:
     }
 
     void PrintOOBMemoryRead(uint32_t vaddr, std::string funcName) {
-        if (vaddr < 0x1000) {
+        if (vaddr < 0x40000000) {
             std::lock_guard<std::mutex> lock(console_mutex);
             std::cout << "\n[CRASH TRAP] Caught OOB reading " << funcName <<  " 0x" << std::hex << vaddr << std::dec << "!" << std::endl;
             if (cpu) {
@@ -91,6 +92,12 @@ public:
     }
 
     void CallSVC(uint32_t swi) override {
+        // --- pthread_once_done detection ---
+        if (swi == 0xFFFFFF) {
+            cpu->HaltExecution(Dynarmic::HaltReason::UserDefined3);
+            return;
+        }
+
         std::string name = loader.GetSymbolName(swi);
         router.Invoke(name, cpu);
     }

@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <sys/mman.h>
+#include <queue>
 
 #include <cstring>
 #include <map>
@@ -25,6 +26,7 @@ public:
 
     uint32_t current_heap_ptr = CODE_BASE + 0x10000000;
     std::mutex allocator_mutex;
+    
     std::map<uint32_t, uint32_t> free_blocks;           // Address -> Size
     std::unordered_map<uint32_t, uint32_t> allocations; // Address -> Size
 
@@ -46,7 +48,7 @@ public:
                                MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (kuser_ptr == MAP_FAILED) throw std::runtime_error("Failed to commit kernel helper page!");
 
-        /////// new (was having issues with it forceably reading EF000000, no function call)
+        // (was having issues with it forceably reading EF000000, no function call)
         // 4. Commit the C-Type Hack Page at 0xEF000000 (64KB size)
         void* ctype_ptr = mmap(fastmem_base + 0xEF000000, 0x10000, 
                                PROT_READ | PROT_WRITE, 
@@ -57,7 +59,6 @@ public:
         for (int i = 0; i < 16; i++) {
             page_table[0xEF000 + i] = (uint8_t*)ctype_ptr + (i * 4096);
         }
-        //////// endnew
 
         // Initialize the page table to point to our Fastmem base
         page_table.fill(nullptr);
@@ -91,12 +92,12 @@ public:
     }
 
     uint8_t* GetHostPointer(uint32_t vaddr) {
-        // 1. Allow access to the 4KB Kernel Helper Page
+        // Allow access to the 4KB Kernel Helper Page
         if (vaddr >= 0xFFFF0000 && vaddr < 0xFFFF1000) {
             return fastmem_base + vaddr;
         }
 
-        // 2. Allow access to the C-Type Hack Page
+        // Allow access to the C-Type Hack Page
         if (vaddr >= 0xEF000000 && vaddr < 0xEF010000) return fastmem_base + vaddr;
         
         if (vaddr < CODE_BASE || vaddr >= CODE_BASE + MEMORY_SIZE) {
@@ -137,7 +138,7 @@ public:
 
         std::lock_guard<std::mutex> lock(allocator_mutex);
 
-        // 1. Search for a free block that fits (First-Fit)
+        // Search for a free block that fits (First-Fit)
         for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
             if (it->second >= size) {
                 uint32_t addr = it->first;
@@ -155,7 +156,7 @@ public:
             }
         }
 
-        // 2. Fallback to Bump Allocator if no free blocks are large enough
+        // Fallback to Bump Allocator if no free blocks are large enough
         uint32_t ptr = current_heap_ptr;
         current_heap_ptr += size;
         if (current_heap_ptr >= CODE_BASE + MEMORY_SIZE) {
@@ -173,9 +174,10 @@ public:
         if (it != allocations.end()) {
             uint32_t size = it->second;
             allocations.erase(it);
+
             free_blocks[ptr] = size;
 
-            // 3. Coalesce (Merge) adjacent free blocks to prevent fragmentation
+            // Coalesce adjacent free blocks to prevent fragmentation
             auto current = free_blocks.find(ptr);
             
             auto next = std::next(current); // Merge forward
@@ -194,7 +196,6 @@ public:
         }
     }
 
-    // --- NEW: ReallocHeap ---
     uint32_t ReallocHeap(uint32_t ptr, uint32_t new_size) {
         if (ptr == 0) return AllocateHeap(new_size);
         if (new_size == 0) { FreeHeap(ptr); return 0; }

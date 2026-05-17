@@ -21,7 +21,6 @@ static std::mutex console_mutex;
 
 class SyscallRouter {
 public:
-    // Notice the added file and line arguments
     void RegisterInternal(const std::string& name, const char* file, int line, SyscallHandler handler) {
         // Strip the long absolute paths (e.g., /home/user/workspace/src/...) to just the filename
         std::string filename = file;
@@ -36,11 +35,13 @@ public:
     void Invoke(const std::string& name, Dynarmic::A32::Jit* cpu) {
         auto it = handlers.find(name);
         if (it != handlers.end()) {
-            //std::cout << "[TID: " << std::this_thread::get_id() << "] "
-            //          << "Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
-            // Optional: You can print the file it came from here too!
-            //std::cout << "[Router] Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
-            // OPTIONAL: Uncomment to see successful calls 
+            /* IGNORE: extra optional debug prints
+                std::cout << "[TID: " << std::this_thread::get_id() << "] "
+                          << "Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
+                Optional: You can print the file it came from here too!
+                std::cout << "[Router] Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
+                OPTIONAL: Uncomment to see successful calls
+            */
             {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[TID: " << std::this_thread::get_id() << "] Executing: " << name << "\n";
@@ -53,7 +54,6 @@ public:
         }
     }
 
-    // Call this right after you finish registering everything in main.cpp!
     void DumpSyscallMap(const std::string& filepath) {
         std::ofstream out(filepath);
         if (!out) return;
@@ -79,6 +79,5 @@ private:
 };
 
 // --- THE MAGIC MACRO ---
-// Use this instead of router.Register() so it automatically injects __FILE__ and __LINE__
 #define ROUTE_REGISTER(router_obj, name, ...) \
     router_obj.RegisterInternal(name, __FILE__, __LINE__, __VA_ARGS__)

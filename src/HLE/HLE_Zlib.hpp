@@ -12,8 +12,6 @@ namespace HLE::Zlib {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
 
-        // TODO: inflateReset, deflate, deflateEnd, deflateInit_, deflateInit2, deflateReset, get_crc_table
-
         constexpr uint32_t Z32_NEXT_IN   = 0;
         constexpr uint32_t Z32_AVAIL_IN  = 4;
         constexpr uint32_t Z32_TOTAL_IN  = 8;
@@ -23,7 +21,6 @@ namespace HLE::Zlib {
         constexpr uint32_t Z32_ADLER     = 48;
 
         static std::mutex zlib_mutex;
-        //static std::unordered_map<uint32_t, z_stream> host_zstreams;
         static std::unordered_map<uint32_t, std::unique_ptr<z_stream>> host_zstreams;
 
         auto z_sync_in =[](GuestMemory& mem, uint32_t gp, z_stream& zs, uint32_t& old_next_in, uint32_t& old_avail_in, uint32_t& old_next_out, uint32_t& old_avail_out) {
@@ -64,27 +61,27 @@ namespace HLE::Zlib {
 
             auto& zs = host_zstreams[stream_ptr];
     
-            // 1. Sync IN from Guest to Host
+            // Sync IN from Guest to Host
             uint32_t oni = memory.Read32(stream_ptr + Z32_NEXT_IN);
             uint32_t oai = memory.Read32(stream_ptr + Z32_AVAIL_IN);
             uint32_t ono = memory.Read32(stream_ptr + Z32_NEXT_OUT);
             uint32_t oao = memory.Read32(stream_ptr + Z32_AVAIL_OUT);
 
-            // changed these 4
             zs->avail_in  = oai;
             zs->avail_out = oao;
             zs->next_in   = oni ? memory.GetHostPointer(oni) : nullptr;
             zs->next_out  = ono ? memory.GetHostPointer(ono) : nullptr;
 
-            // 2. Perform Host Decompression (&zs -> zs.get())
+            // Perform Host Decompression
             int ret = ::inflate(zs.get(), flush);
 
-            // zs dot to arrow change
-            // 3. Sync OUT from Host to Guest
+            // write host's 'msg' translation back
+            memory.Write32(stream_ptr + 24, 0); // msg = NULL on success
+
+            // Sync OUT from Host to Guest
             uint32_t consumed = oai - zs->avail_in;
             uint32_t produced = oao - zs->avail_out;
 
-            // same zs . > -> change
             memory.Write32(stream_ptr + Z32_NEXT_IN,   oni + consumed);
             memory.Write32(stream_ptr + Z32_AVAIL_IN,  zs->avail_in);
             memory.Write32(stream_ptr + Z32_NEXT_OUT,  ono + produced);
@@ -101,16 +98,19 @@ namespace HLE::Zlib {
                           << "RET: " << ret << std::endl;
             }
 
-            // same zs dot to arrow change
             // Print error if something went wrong (Z_BUF_ERROR is fine, just means it needs more data)
             if (ret < 0 && ret != Z_BUF_ERROR) {
                 std::cout << "[ZLIB] inflate ERROR code: " << ret << " (msg: " << (zs->msg ? zs->msg : "none") << ")\n";
             }
 
+            if (ret == Z_OK) {
+                // write host's 'msg' translation back
+                memory.Write32(stream_ptr + 24, 0); // msg = NULL on success
+            }
+
             cpu->Regs()[0] = ret;
         });
 
-        
         ROUTE_REGISTER(router, "inflateEnd",[](Dynarmic::A32::Jit* cpu) {
             std::lock_guard<std::mutex> lock(zlib_mutex);
             uint32_t stream_ptr = cpu->Regs()[0];
@@ -137,18 +137,21 @@ namespace HLE::Zlib {
             std::lock_guard<std::mutex> lock(zlib_mutex);
             uint32_t stream_ptr = cpu->Regs()[0];
             
-            // 1. Create a heap-allocated unique_ptr
+            // Create a heap-allocated unique_ptr
             auto zs = std::make_unique<z_stream>();
             zs->zalloc = Z_NULL;
             zs->zfree = Z_NULL;
             zs->opaque = Z_NULL;
 
-            // 2. Initialize it (passing the raw pointer using .get())
+            // Initialize it (passing the raw pointer using .get())
             int ret = inflateInit(zs.get());
             
             if (ret == Z_OK) {
-                // 3. MOVE ownership of the smart pointer into the map
+                // MOVE ownership of the smart pointer into the map
                 host_zstreams[stream_ptr] = std::move(zs);
+                memory.Write32(stream_ptr + 24, 0);  // msg
+                memory.Write32(stream_ptr + 28, 0);  // state (opaque to guest)
+                memory.Write32(stream_ptr + 44, 0);  // data_type
             }
             cpu->Regs()[0] = ret;
         });
@@ -158,18 +161,21 @@ namespace HLE::Zlib {
             uint32_t stream_ptr = cpu->Regs()[0];
             int windowBits = static_cast<int>(cpu->Regs()[1]);
 
-            // 1. Create a heap-allocated unique_ptr
+            // Create a heap-allocated unique_ptr
             auto zs = std::make_unique<z_stream>();
             zs->zalloc = Z_NULL;
             zs->zfree = Z_NULL;
             zs->opaque = Z_NULL;
 
-            // 2. Initialize it
+            // Initialize
             int ret = inflateInit2(zs.get(), windowBits);
             
             if (ret == Z_OK) {
-                // 3. MOVE ownership of the smart pointer into the map
+                // MOVE ownership of the smart pointer into the map
                 host_zstreams[stream_ptr] = std::move(zs);
+                memory.Write32(stream_ptr + 24, 0);  // msg
+                memory.Write32(stream_ptr + 28, 0);  // state (opaque to guest)
+                memory.Write32(stream_ptr + 44, 0);  // data_type
             }
             cpu->Regs()[0] = ret;
         });

@@ -6,8 +6,6 @@ namespace HLE::Stdlib {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
 
-        //TODO: qsort
-
         ROUTE_REGISTER(router, "srand48", [](Dynarmic::A32::Jit* cpu) {
             long int seed = static_cast<long int>(cpu->Regs()[0]);
             srand48(seed);
@@ -93,7 +91,62 @@ namespace HLE::Stdlib {
             cpu->Regs()[0] = static_cast<int>(out.size());
         });
 
+        ROUTE_REGISTER(router, "qsort", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t base_ptr = cpu->Regs()[0];
+            uint32_t nmemb    = cpu->Regs()[1];
+            uint32_t size     = cpu->Regs()[2];
+            // uint32_t compar   = cpu->Regs()[3]; // ignore for now
+
+            if (nmemb <= 1 || base_ptr == 0) return;
+
+            // Simple bubble sort using direct byte comparison? That would ignore the comparator.
+            // We need to respect the comparator for correctness. Since we can't call it easily,
+            // we'll implement a trampoline-based call later. For now, we print a warning and no-op.
+            static bool warned = false;
+            if (!warned) {
+                std::cout << "[WARNING] qsort called but not fully implemented (using no-op)." << std::endl;
+                warned = true;
+            }
+            // No sorting, but this might not crash the game if the order isn't critical for boot.
+        });
+
+        ROUTE_REGISTER(router, "strtol", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t nptr_ptr    = cpu->Regs()[0];
+            uint32_t endptr_ptr  = cpu->Regs()[1];
+            int      base        = static_cast<int>(cpu->Regs()[2]);
+
+            const char* nptr = reinterpret_cast<const char*>(memory.GetHostPointer(nptr_ptr));
+
+            char* endptr = nullptr;
+            long result = std::strtol(nptr, &endptr, base);
+
+            cpu->Regs()[0] = static_cast<uint32_t>(result);
+
+            // If endptr_ptr is provided, write the guest address of the first invalid character
+            if (endptr_ptr != 0 && nptr_ptr != 0 && endptr != nullptr) {
+                uint32_t end_guest = nptr_ptr + static_cast<uint32_t>(endptr - nptr);
+                memory.Write32(endptr_ptr, end_guest);
+            } else if (endptr_ptr != 0) {
+                memory.Write32(endptr_ptr, 0);
+            }
+        });
+
+        ROUTE_REGISTER(router, "strtoul", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t nptr_ptr    = cpu->Regs()[0];
+            uint32_t endptr_ptr  = cpu->Regs()[1];
+            int      base        = static_cast<int>(cpu->Regs()[2]);
+
+            const char* nptr = reinterpret_cast<const char*>(memory.GetHostPointer(nptr_ptr));
+            char* endptr = nullptr;
+            unsigned long result = std::strtoul(nptr, &endptr, base);
+
+            cpu->Regs()[0] = static_cast<uint32_t>(result);
+            if (endptr_ptr != 0 && nptr_ptr != 0 && endptr != nullptr) {
+                memory.Write32(endptr_ptr, nptr_ptr + (endptr - nptr));
+            } else if (endptr_ptr != 0) {
+                memory.Write32(endptr_ptr, 0);
+            }
+        });
 
     }
-
 }

@@ -4,6 +4,7 @@
 #include "ElfLoader.hpp"
 #include "EmuCallbacks.hpp"
 #include "AndroidCP15.hpp"
+#include "ThreadingHelpers.hpp"
 
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <thread>
@@ -16,14 +17,14 @@ namespace HLE::Threading {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor) {
 
-        // TODO: pthread_getspecific, pthread_setspecific, pthread_setname_np
-
         static std::mutex host_mutex_lock;
         static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> host_mutexes;
 
         auto pthread_success = [](Dynarmic::A32::Jit* cpu) {
             cpu->Regs()[0] = 0; // 0 = Success
         };
+
+        static std::mutex once_global_mutex;   // serialises all pthread_once calls
 
         ROUTE_REGISTER(router, "pthread_attr_setschedparam", pthread_success);
         ROUTE_REGISTER(router, "pthread_attr_setstacksize", pthread_success);
@@ -55,7 +56,7 @@ namespace HLE::Threading {
             
             if (thread_ptr) memory.Write32(thread_ptr, core_id);
             
-            // Fire off the background thread!
+            // Fire off the background thread
             std::thread([&memory, &loader, &router, &monitor, entry, arg, sp, tls, core_id, stack_size]() {
                 
                 // Each thread gets its own callback handler pointing to its own CPU
@@ -84,20 +85,30 @@ namespace HLE::Threading {
                 thread_cpu.Regs()[15] = entry & ~1;
                 thread_cpu.SetCpsr((entry & 1) ? 0x30 : 0x10);
                 
-                // Background Emulator Loop!
+                // Background Emulator Loop
                 while (true) {
                     auto halt = thread_cpu.Run();
 
                     // Check if the CPU halted because it reached our exit SVC
                     if (halt == Dynarmic::HaltReason::UserDefined1 && 
                         thread_cpu.Regs()[15] == (loader.GetThunk("pthread_exit") & ~1)) {
-                        break; // Clean exit!
+                        break; // Clean exit
                     }
     
                     if (halt == Dynarmic::HaltReason::UserDefined2) {
                         thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    } 
+                    }
+
+                    if (halt == Dynarmic::HaltReason::UserDefined3) {
+                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
+                        if (once_saved_state.valid) {
+                            for (int r = 0; r < 16; r++)
+                                thread_cpu.Regs()[r] = once_saved_state.regs[r];
+                            thread_cpu.SetCpsr(once_saved_state.cpsr);
+                            once_saved_state.valid = false;
+                        }
+                    }
                 }
                 
                 // Clean up memory after thread exit
@@ -105,7 +116,7 @@ namespace HLE::Threading {
                 memory.FreeHeap(tls);
                 std::cout << "[Threading] Background thread exited gracefully." << std::endl;
                 
-            }).detach(); // Detach allows it to run freely alongside the main emulator thread!
+            }).detach(); // Detach allows it to run freely alongside the main threads
             
             cpu->Regs()[0] = 0; // Success
         });
@@ -119,12 +130,39 @@ namespace HLE::Threading {
             cpu->Regs()[0] = 1; // Return a dummy thread ID
         });
 
-        ROUTE_REGISTER(router, "pthread_once", [&memory](Dynarmic::A32::Jit* cpu) {
+        ROUTE_REGISTER(router, "pthread_once", [&](Dynarmic::A32::Jit* cpu) {
             uint32_t once_control_ptr = cpu->Regs()[0];
-            // Mark the control variable as "completed" (usually 2 in Bionic libc)
-            // This prevents the game from getting stuck in an infinite init loop
-            if (once_control_ptr != 0) memory.Write32(once_control_ptr, 2);
-            cpu->Regs()[0] = 0; // Success
+            uint32_t init_routine     = cpu->Regs()[1];
+
+            // Use unique_lock so we can unlock manually
+            std::unique_lock<std::mutex> lock(once_global_mutex);
+
+            int current_val = once_control_ptr ? static_cast<int>(memory.Read32(once_control_ptr)) : 2;
+            if (current_val == 2) {
+                cpu->Regs()[0] = 0;   // already done
+                return;
+            }
+
+            // Mark as done BEFORE releasing the lock – other threads *should* immediately see 2 ...
+            if (once_control_ptr)
+                memory.Write32(once_control_ptr, 2);
+
+            // Save the complete CPU context (thread‑local, shared with the loop)
+            for (int i = 0; i < 16; i++)
+                once_saved_state.regs[i] = cpu->Regs()[i];
+            once_saved_state.cpsr = cpu->Cpsr();
+            once_saved_state.valid = true;
+
+            // Prepare the CPU to run the init routine
+            cpu->Regs()[14] = loader.GetThunk("pthread_once_done");   // return address
+            cpu->Regs()[15] = init_routine & ~1;                      // start of init
+            uint32_t new_cpsr = (init_routine & 1) ? 0x00000030 : 0x00000010;
+            cpu->SetCpsr(new_cpsr);
+
+            lock.unlock();
+
+            // syscall returns normally (R0=0), and Dynarmic should execute the init routine
+            cpu->Regs()[0] = 0;
         });
 
         ROUTE_REGISTER(router, "pthread_attr_init", [&memory](Dynarmic::A32::Jit* cpu) {
@@ -143,7 +181,7 @@ namespace HLE::Threading {
                 if (!host_mutexes[mutex_ptr]) host_mutexes[mutex_ptr] = std::make_shared<std::recursive_mutex>();
                 m = host_mutexes[mutex_ptr];
             }
-            m->lock(); // Block natively!
+            m->lock(); // Block natively
             cpu->Regs()[0] = 0;
         });
 
@@ -166,7 +204,9 @@ namespace HLE::Threading {
         });
 
         ROUTE_REGISTER(router, "pthread_cond_timedwait", [&memory](Dynarmic::A32::Jit* cpu) {
-            /*
+            /* WARNING: experimental
+            // Blocking for now
+
             uint32_t abstime_ptr = cpu->Regs()[2];
 
             int64_t sleep_us = 1000; // hard minimum: always yield at least 1 ms
@@ -188,13 +228,12 @@ namespace HLE::Threading {
 
             if (sleep_us > 0) {
                 usleep(static_cast<useconds_t>(sleep_us));
-            } */
+            }
+            */
 
             cpu->Regs()[0] = ETIMEDOUT; // 110
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined2);
         });
 
-
     }
-
 }

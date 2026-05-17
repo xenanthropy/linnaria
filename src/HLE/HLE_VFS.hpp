@@ -16,43 +16,12 @@ namespace HLE::VFS {
 
         static uint32_t next_file_handle = 0x1000; // Start fake handles at 0x1000
 
-        //TODO: rewind, fgetc, getc, fputc, putc, putchar, ungetc, ungetwc, getwc, putwc,
-        //      fprintf, vfprintf, clearerr, ferror, fdopen, setvbuf, open, writev, fcntl
-        //      access, fstat, stat, chmod, mkdir, remove, rename, opendir, closedir, readdir, alphasort
+        // Fake file storage
+        static std::mutex fake_fd_mutex;
+        static int next_fake_fd = 10000;               // start above real fds
+        static std::unordered_map<int, std::string> fake_files; // fd -> content
+        static std::unordered_map<int, size_t> fake_file_pos;  // fd -> current read position
 
-        /* kimi change...
-        ROUTE_REGISTER(router, "fopen", [&memory](Dynarmic::A32::Jit* cpu) {
-            uint32_t path_ptr = cpu->Regs()[0];
-            uint32_t mode_ptr = cpu->Regs()[1];
-
-            const char* path = reinterpret_cast<const char*>(memory.GetHostPointer(path_ptr));
-            const char* mode = reinterpret_cast<const char*>(memory.GetHostPointer(mode_ptr));
-
-            FILE* fp = std::fopen(path, mode);
-            if (!fp) {
-                cpu->Regs()[0] = 0; // NULL
-                return;
-            }
-
-            uint32_t handle = next_file_handle++;
-            open_files[handle] = fp;
-            cpu->Regs()[0] = handle;
-        });
-
-        ROUTE_REGISTER(router, "fclose", [](Dynarmic::A32::Jit* cpu) {
-            uint32_t handle = cpu->Regs()[0];
-            auto it = open_files.find(handle);
-            if (it != open_files.end()) {
-                std::fclose(it->second);
-                open_files.erase(it);
-                cpu->Regs()[0] = 0;
-            } else {
-                cpu->Regs()[0] = EOF;
-            }
-        });
-        */
-
-        // round 2 "solution"
         ROUTE_REGISTER(router, "fopen", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t path_ptr = cpu->Regs()[0];
             uint32_t mode_ptr = cpu->Regs()[1];
@@ -88,40 +57,6 @@ namespace HLE::VFS {
             open_files[guest_file] = fp;
             cpu->Regs()[0] = guest_file;
         });
-
-        /* round 2 debugging of kimi...
-        ROUTE_REGISTER(router, "fopen", [&memory](Dynarmic::A32::Jit* cpu) {
-            uint32_t path_ptr = cpu->Regs()[0];
-            uint32_t mode_ptr = cpu->Regs()[1];
-
-            const char* path = reinterpret_cast<const char*>(memory.GetHostPointer(path_ptr));
-            const char* mode = reinterpret_cast<const char*>(memory.GetHostPointer(mode_ptr));
-
-            FILE* fp = std::fopen(path, mode);
-            if (!fp) {
-                cpu->Regs()[0] = 0;
-                return;
-            }
-
-            int fd = ::fileno(fp);
-
-            // Allocate a fake Bionic FILE struct in guest memory.
-            // Fill every 4-byte slot with the real fd so ANY field read
-            // (_file, _flags interpreted as fd, etc.) yields a valid descriptor.
-            uint32_t guest_file = memory.AllocateHeap(256);
-            for (int i = 0; i < 256; i += 4) {
-                memory.Write32(guest_file + i, fd);
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[VFS] fopen guest_file=0x" << std::hex << guest_file
-                          << " fd=" << fd << " path=" << path << std::dec << std::endl;
-            }
-            open_files[guest_file] = fp;
-            cpu->Regs()[0] = guest_file;
-        });
-        */
 
         ROUTE_REGISTER(router, "fclose", [&memory](Dynarmic::A32::Jit* cpu) {
             std::lock_guard<std::mutex> lock(file_mutex);
@@ -187,8 +122,33 @@ namespace HLE::VFS {
             }
         });
 
-        ROUTE_REGISTER(router, "lseek", [](Dynarmic::A32::Jit* cpu) {
-            cpu->Regs()[0] = lseek(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2]);
+        ROUTE_REGISTER(router, "lseek", [&memory](Dynarmic::A32::Jit* cpu) {
+            int fd = static_cast<int>(cpu->Regs()[0]);
+            off_t offset = static_cast<off_t>(cpu->Regs()[1]);
+            int whence = cpu->Regs()[2];
+
+            {
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                auto it = fake_files.find(fd);
+                if (it != fake_files.end()) {
+                    auto& content = it->second;
+                    auto& pos = fake_file_pos[fd];
+                    switch (whence) {
+                        case SEEK_SET: pos = offset; break;
+                        case SEEK_CUR: pos += offset; break;
+                        case SEEK_END: pos = content.size() + offset; break;
+                        default: cpu->Regs()[0] = -1; return;
+                    }
+                    // Clamp to valid range
+                    if (pos > content.size()) pos = content.size();
+                    cpu->Regs()[0] = static_cast<uint32_t>(pos);
+                    std::cout << "[VFS] lseek fake fd=" << fd << " -> pos=" << pos << std::endl;
+                    return;
+                }
+            }
+
+            // Not a fake FD, use real lseek
+            cpu->Regs()[0] = ::lseek(fd, offset, whence);
         });
 
         ROUTE_REGISTER(router, "ftell", [](Dynarmic::A32::Jit* cpu) {
@@ -214,7 +174,7 @@ namespace HLE::VFS {
 
         ROUTE_REGISTER(router, "fputs", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t str_ptr = cpu->Regs()[0];
-            
+
             std::string str = reinterpret_cast<const char*>(memory.GetHostPointer(str_ptr));
             std::cout << "[Guest stdout] " << str;
             cpu->Regs()[0] = 1; // Return >= 0 for success
@@ -228,33 +188,40 @@ namespace HLE::VFS {
             cpu->Regs()[0] = 1; // Success
         });
 
-
         ROUTE_REGISTER(router, "close", [](Dynarmic::A32::Jit* cpu) {
             int fd = static_cast<int>(cpu->Regs()[0]);
+            {
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                if (fake_files.find(fd) != fake_files.end()) {
+                    fake_files.erase(fd);
+                    fake_file_pos.erase(fd);
+                    cpu->Regs()[0] = 0;
+                    return;
+                }
+            }
             cpu->Regs()[0] = ::close(fd);
         });
 
-
-        /*
         ROUTE_REGISTER(router, "read", [&memory](Dynarmic::A32::Jit* cpu) {
             int fd         = static_cast<int>(cpu->Regs()[0]);
             uint32_t buf   = cpu->Regs()[1];
             uint32_t count = cpu->Regs()[2];
 
-            // Fake EOF for everything except stdin
-            if (fd == 0) {
-                cpu->Regs()[0] = 0;
-            } else {
-                // You don't have a POSIX fd table yet; just claim EOF
-                cpu->Regs()[0] = 0;
+            // --- Fake file support ---
+            {
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                if (fake_files.find(fd) != fake_files.end()) {
+                    std::string& content = fake_files[fd];
+                    size_t& pos = fake_file_pos[fd];
+                    size_t remaining = content.size() - pos;
+                    size_t to_copy = std::min(static_cast<size_t>(count), remaining);
+                    std::memcpy(memory.GetHostPointer(buf), content.data() + pos, to_copy);
+                    pos += to_copy;
+                    cpu->Regs()[0] = static_cast<uint32_t>(to_copy);
+                    std::cout << "[VFS] read fake fd=" << fd << " returned " << to_copy << " bytes" << std::endl;
+                    return;
+                }
             }
-        });
-        */
-
-        ROUTE_REGISTER(router, "read", [&memory](Dynarmic::A32::Jit* cpu) {
-            int fd         = static_cast<int>(cpu->Regs()[0]);
-            uint32_t buf   = cpu->Regs()[1];
-            uint32_t count = cpu->Regs()[2];
 
             if (fd < 0) {
                 cpu->Regs()[0] = 0; // stdin or invalid
@@ -270,30 +237,80 @@ namespace HLE::VFS {
             uint32_t path_ptr = cpu->Regs()[0];
             int flags = cpu->Regs()[1];
             int mode = cpu->Regs()[2];
-    
+
             if (!path_ptr) { cpu->Regs()[0] = -1; return; }
-    
             const char* path = reinterpret_cast<const char*>(memory.GetHostPointer(path_ptr));
+
+            // ----- Fake system files for Nexus 5 (2013) -----
+            if (strcmp(path, "/proc/cpuinfo") == 0) {
+                // nexus 5 /proc/cpuinfo
+                std::string content =
+                    "Processor\t: ARMv7 Processor rev 0 (v7l)\n"
+                    "processor\t: 0\n"
+                    "BogoMIPS\t: 38.40\n"
+                    "\n"
+                    "processor\t: 1\n"
+                    "BogoMIPS\t: 38.40\n"
+                    "\n"
+                    "processor\t: 2\n"
+                    "BogoMIPS\t: 38.40\n"
+                    "\n"
+                    "processor\t: 3\n"
+                    "BogoMIPS\t: 38.40\n"
+                    "\n"
+                    "Features\t: swp half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt \n"
+                    "CPU implementer\t: 0x51\n"
+                    "CPU architecture: 7\n"
+                    "CPU variant\t: 0x2\n"
+                    "CPU part\t: 0x06f\n"
+                    "CPU revision\t: 0\n"
+                    "\n"
+                    "Hardware\t: Qualcomm MSM 8974 HAMMERHEAD (Flattened Device Tree)\n"
+                    "Revision\t: 000b\n"
+                    "Serial\t: 0000000000000000\n";
+                    std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                    int fd = next_fake_fd++;
+                    fake_files[fd] = content;
+                    fake_file_pos[fd] = 0;
+                    cpu->Regs()[0] = fd;
+                    std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                    return;
+            }
+            if (strcmp(path, "/sys/devices/system/cpu/present") == 0) {
+                std::string content = "0-3\n";
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                int fd = next_fake_fd++;
+                fake_files[fd] = content;
+                fake_file_pos[fd] = 0;
+                cpu->Regs()[0] = fd;
+                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                return;
+            }
+            if (strcmp(path, "/sys/devices/system/cpu/possible") == 0) {
+                std::string content = "0-3\n";
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                int fd = next_fake_fd++;
+                fake_files[fd] = content;
+                fake_file_pos[fd] = 0;
+                cpu->Regs()[0] = fd;
+                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                return;
+            }
+            if (strcmp(path, "/proc/self/auxv") == 0) {
+                // If the game still tries to read auxv after getauxval, return empty
+                std::string content(8, '\0'); // 8 zero bytes = end of auxv
+                std::lock_guard<std::mutex> lock(fake_fd_mutex);
+                int fd = next_fake_fd++;
+                fake_files[fd] = content;
+                fake_file_pos[fd] = 0;
+                cpu->Regs()[0] = fd;
+                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                return;
+            }
+
+            // Not a faked path – use real open
             cpu->Regs()[0] = ::open(path, flags, mode);
         });
-
-        /*
-        ROUTE_REGISTER(router, "write", [&memory](Dynarmic::A32::Jit* cpu) {
-            int fd = static_cast<int>(cpu->Regs()[0]);
-            uint32_t buf_ptr = cpu->Regs()[1];
-            uint32_t count = cpu->Regs()[2];
-
-            if (fd == 1 || fd == 2) {
-                // It's trying to print to stdout/stderr. Just swallow it.
-                cpu->Regs()[0] = count; 
-            } else {
-                // It's a real file! Write the data to the host disk!
-                const void* buf = memory.GetHostPointer(buf_ptr);
-                cpu->Regs()[0] = ::write(fd, buf, count);
-            }
-        });
-        */
-
         
         ROUTE_REGISTER(router, "write", [&memory](Dynarmic::A32::Jit* cpu) {
             int fd = static_cast<int>(cpu->Regs()[0]);
@@ -418,26 +435,6 @@ namespace HLE::VFS {
             }
         });
 
-
-        /*
-        ROUTE_REGISTER(router, "writev", [&memory](Dynarmic::A32::Jit* cpu) {
-            int fd = cpu->Regs()[0];
-            uint32_t iov_ptr = cpu->Regs()[1];
-            int iovcnt = cpu->Regs()[2];
-
-            // Guest iovec is 8 bytes (4-byte pointer, 4-byte size)
-            // Host iovec is 16 bytes (8-byte pointer, 8-byte size)
-            std::vector<struct iovec> host_iov(iovcnt);
-            for (int i = 0; i < iovcnt; ++i) {
-                uint32_t base = memory.Read32(iov_ptr + (i * 8));
-                uint32_t len  = memory.Read32(iov_ptr + (i * 8) + 4);
-                host_iov[i].iov_base = base ? memory.GetHostPointer(base) : nullptr;
-                host_iov[i].iov_len  = len;
-            }
-            cpu->Regs()[0] = ::writev(fd, host_iov.data(), iovcnt);
-        });
-        */
-
         ROUTE_REGISTER(router, "writev", [&memory](Dynarmic::A32::Jit* cpu) {
             int fd = static_cast<int>(cpu->Regs()[0]);
             uint32_t iov_ptr = cpu->Regs()[1];
@@ -465,9 +462,9 @@ namespace HLE::VFS {
             uint32_t readfds_ptr = cpu->Regs()[1];
             uint32_t writefds_ptr = cpu->Regs()[2];
             uint32_t exceptfds_ptr = cpu->Regs()[3];
-            uint32_t timeout_ptr = memory.Read32(cpu->Regs()[13]); // Arg 5 on stack!
+            uint32_t timeout_ptr = memory.Read32(cpu->Regs()[13]); // Arg 5 on stack
 
-            // Luckily, fd_set is 128 bytes on both 32-bit Android and 64-bit Linux!
+            // Luckily, fd_set is 128 bytes on both 32-bit Android and 64-bit Linux
             fd_set* h_read = readfds_ptr ? (fd_set*)memory.GetHostPointer(readfds_ptr) : nullptr;
             fd_set* h_write = writefds_ptr ? (fd_set*)memory.GetHostPointer(writefds_ptr) : nullptr;
             fd_set* h_except = exceptfds_ptr ? (fd_set*)memory.GetHostPointer(exceptfds_ptr) : nullptr;
@@ -482,6 +479,14 @@ namespace HLE::VFS {
             }
 
             cpu->Regs()[0] = ::select(nfds, h_read, h_write, h_except, p_tv);
+        });
+
+        ROUTE_REGISTER(router, "access", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t path_ptr = cpu->Regs()[0];
+            int mode = cpu->Regs()[1];
+
+            const char* path = reinterpret_cast<const char*>(memory.GetHostPointer(path_ptr));
+            cpu->Regs()[0] = ::access(path, mode);
         });
 
     }

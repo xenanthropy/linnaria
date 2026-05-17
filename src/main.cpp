@@ -10,6 +10,7 @@
 #include "JNIEmulator.hpp"
 #include "AndroidCP15.hpp"
 #include "AndroidEnvironment.hpp"
+#include "ThreadingHelpers.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -76,6 +77,16 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
         if (halt_reason == Dynarmic::HaltReason::UserDefined2) {
             cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
         }
+
+        if (halt_reason == Dynarmic::HaltReason::UserDefined3) {
+            cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
+            if (once_saved_state.valid) {
+                for (int r = 0; r < 16; r++)
+                    cpu.Regs()[r] = once_saved_state.regs[r];
+                cpu.SetCpsr(once_saved_state.cpsr);
+                once_saved_state.valid = false;
+            }
+        }
     }
 }
 
@@ -112,11 +123,20 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
     cpu.Regs()[15] = func_addr & ~1; 
 
     while (true) {
-        auto halt_reason = cpu.Run(); 
+        auto halt_reason = cpu.Run();
         if (halt_reason == Dynarmic::HaltReason::UserDefined1) {
             std::cout << "[Boot] Thread returned successfully!" << std::endl;
             cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
             break;
+        }
+        if (halt_reason == Dynarmic::HaltReason::UserDefined3) {
+            cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
+            if (once_saved_state.valid) {
+                for (int r = 0; r < 16; r++)
+                    cpu.Regs()[r] = once_saved_state.regs[r];
+                cpu.SetCpsr(once_saved_state.cpsr);
+                once_saved_state.valid = false;
+            }
         }
     }
 }
@@ -155,7 +175,7 @@ int main(int argc, char** argv) {
             exit(1);
         }
 
-        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClearColor(0.0f, 1.0f, 0.4f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         SDL_GL_SwapWindow(window);
 
@@ -166,17 +186,13 @@ int main(int argc, char** argv) {
         ElfLoader loader(memory);
         if (!loader.Load(argv[1])) return 1;
 
-        // 1. Initialize our clean Syscall Router
+        // Initialize our clean Syscall Router
         SyscallRouter router;
 
-        ////// NEWWWWW. 
-        //std::vector<EmuThread> worker_threads;
-        //AndroidEnvironment::RegisterAll(router, memory, worker_threads);
-
-        // --- UPDATED: Setup Global Monitor BEFORE AndroidEnvironment setup ---
+        // --- Setup Global Monitor BEFORE AndroidEnvironment setup ---
         Dynarmic::ExclusiveMonitor monitor(256); // Support up to 256 hardware threads!
         
-        // --- UPDATED: Register environment calls ---
+        // --- Register environment calls ---
         AndroidEnvironment::RegisterAll(router, memory, loader, monitor);
 
         // save all registered functions to file
@@ -190,7 +206,11 @@ int main(int argc, char** argv) {
         // Give Dynarmic BOTH memory paths to prevent Xbyak fallback crashes
         config.page_table = &memory.page_table;
         config.absolute_offset_page_table = false;
-        config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
+
+        /* DEBUG: disable fastmem_pointer to check memory issues - leave on otherwise */
+        //config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
+        config.fastmem_pointer = 0;
+
         config.recompile_on_fastmem_failure = true;
         config.arch_version = Dynarmic::A32::ArchVersion::v7;
 
@@ -199,7 +219,8 @@ int main(int argc, char** argv) {
         uint32_t main_tls = memory.AllocateHeap(4096);
         config.coprocessors[15] = std::make_shared<AndroidCP15>(main_tls);
 
-        // enable BIG BOI debugging
+        // DEBUG: enable BIG BOI debugging for bad issues
+        // Keep disabled otherwise, way too much logging
         //config.very_verbose_debugging_output = true;
         
         Dynarmic::A32::Jit cpu(config);
@@ -212,7 +233,7 @@ int main(int argc, char** argv) {
             ExecuteGameFunction(cpu, memory, loader, ctor, {});
         }
 
-        // 4. Find the actual game entry point!
+        // 4. Find the actual game entry point
         uint32_t on_create = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnCreateActivity");
         if (!on_create) on_create = loader.GetExport("nativeOnCreateActivity");
 
@@ -261,6 +282,9 @@ int main(int argc, char** argv) {
         // Floats must be passed as raw 32-bit bitcasts
         uint32_t cmW, cmH, diag;
         float f_cmW = 14.0f, f_cmH = 7.0f, f_diag = 6.0f;
+        
+        // DEBUG: test bigger resolution when necessary (1920x1080 screen)
+        //float f_cmW = 12.0f, f_cmH = 6.0f, f_diag = 14.0f;
         std::memcpy(&cmW, &f_cmW, 4);
         std::memcpy(&cmH, &f_cmH, 4);
         std::memcpy(&diag, &f_diag, 4);
@@ -268,6 +292,8 @@ int main(int argc, char** argv) {
         ExecuteGameFunction(cpu, memory, loader, 
             "Java_com_codeglue_terraria_OctarineBridge_nativeOnResizeSurface", 
             { env_ptr, 0, 1280, 720, cmW, cmH, diag }
+            // DEBUG: test bigger resolution when necessary (1920x1080 screen)
+            //{ env_ptr, 0, 1920, 1080, cmW, cmH, diag }
         );
 
         // IGNORE: was experimenting with nativeOnExpansionFileExtracted and nativeUnlockGame
@@ -275,36 +301,19 @@ int main(int argc, char** argv) {
         std::strcpy(reinterpret_cast<char*>(memory.GetHostPointer(fake_path_ptr)), "./obb");
         uint32_t on_expansion_extracted = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted");
         if (on_expansion_extracted) {
-            //std::cout << "[Boot] Firing nativeOnExpansionFileExtracted..." << std::endl;
             ExecuteGameFunction(cpu, memory, loader, "Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted", { env_ptr, 0, fake_path_ptr });
         }
 
-        // Second call with empty string (as Terraria.onCreate does)
-        /*
-        uint32_t empty_str = memory.AllocateHeap(1);
-        memory.Write8(empty_str, 0);
-        //std::cout << "[Boot] Firing nativeOnExpansionFileExtracted with no string..." << std::endl;
-        ExecuteGameFunction(cpu, memory, loader,  "Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted", { env_ptr, 0, empty_str });
-        */
 
-        // 2. Tell the engine we own the full game (Terraria.java calls this with true, "")
-
-        // Terraria.java explicitly calls nativeUnlockGame(true, "");
-        // Allocate a fresh, empty string for this specific call!
+        // Tell the engine we own the full game (Terraria.java calls this with true, "")
         uint32_t on_unlock = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeUnlockGame");
         if (on_unlock) {
-            // Terraria.java explicitly calls nativeUnlockGame(true, "");
-            // Allocate a fresh, empty string for this specific call!
             uint32_t empty_str_ptr = memory.AllocateHeap(4);
             std::strcpy(reinterpret_cast<char*>(memory.GetHostPointer(empty_str_ptr)), ""); 
             // env_ptr, clazz, jboolean (1 = true), jstring (0)
             ExecuteGameFunction(cpu, memory, loader, "Java_com_codeglue_terraria_OctarineBridge_nativeUnlockGame", { env_ptr, 0, 1, empty_str_ptr });
         }
 
-        // 4. The Main Engine Loop
-        // Java Signature: nativeOnUpdate(int i, int i2)
-        // C++ Signature: (JNIEnv*, jclass, jint, jint)
-        
         uint32_t resume_addr = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnResume");
         if (resume_addr) {
             ExecuteGameFunction(cpu, memory, loader, "Java_com_codeglue_terraria_OctarineBridge_nativeOnResume", { env_ptr, 0 });
@@ -316,23 +325,23 @@ int main(int argc, char** argv) {
         bool running = true;
         uint32_t frame_count = 0;
 
-        //// NEW: Initial main thread setup
         EmuThread main_thread;
         main_thread.is_alive = true;
-        main_thread.regs.fill(0); // <--- ADD THIS
+        main_thread.regs.fill(0);
         main_thread.cpsr = 0x00000030; // Thumb, User mode
         main_thread.regs[13] = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
         main_thread.regs[14] = loader.GetThunk("Emulator_Return_Trap");
         main_thread.regs[15] = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnUpdate") & ~1;
+
         // First-frame arguments
+        // Java Signature: nativeOnUpdate(int i, int i2)
+        // C++ Signature: (JNIEnv*, jclass, jint, jint)
         main_thread.regs[0] = env_ptr;
         main_thread.regs[1] = 0;
         main_thread.regs[2] = 1;
         main_thread.regs[3] = 1;
         ///////////////////////////////////
 
-
-        //// NEW: New while running loop (kimi)
         while (running) {
             uint32_t frame_start = SDL_GetTicks();
 
@@ -356,37 +365,52 @@ int main(int argc, char** argv) {
 
                 if (halt == Dynarmic::HaltReason::UserDefined1) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
-                    // Function returned! This means one guest frame finished.
+                    // Function returned, this means one guest frame finished.
                     // For the next host frame, re-enter nativeOnUpdate.
                     main_thread.regs[15] = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnUpdate") & ~1;
                     main_thread.regs[0]  = env_ptr;
                     main_thread.regs[1]  = 0;
                     main_thread.regs[2]  = 1;
                     main_thread.regs[3]  = 1;
-                    // Re-arm the return trap (LR stays the same if you want, but reset to be safe)
+                    // Re-arm the return trap (just in case)
                     main_thread.regs[14] = loader.GetThunk("Emulator_Return_Trap");
                     main_thread.regs[13] = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
 
-                    // !!!!! CRITICAL: The return thunk is ARM code, so the saved CPSR is ARM mode.
+                    // The return thunk is ARM code, so the saved CPSR is ARM mode.
                     // We must force Thumb mode again because nativeOnUpdate is a Thumb function.
                     main_thread.cpsr = 0x00000030;
-
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined2) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
                     // Just yield briefly if the main thread asks to sleep
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
+                else if (halt == Dynarmic::HaltReason::UserDefined3) {
+                    cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
+                    // Restore the saved state from pthread_once redirection
+                    if (once_saved_state.valid) {
+                        for (int r = 0; r < 16; r++)
+                            cpu.Regs()[r] = once_saved_state.regs[r];
+                        cpu.SetCpsr(once_saved_state.cpsr);
+                        once_saved_state.valid = false;
+                        // The CPU now continues from the instruction right after the SVC that triggered pthread_once.
+                        for (int r = 0; r < 16; r++)
+                            main_thread.regs[r] = cpu.Regs()[r];
+                        main_thread.cpsr = cpu.Cpsr();
+                    }
+                }
             }
 
             // --- 4. Present Frame ---
             SDL_GL_SwapWindow(window);
 
-            /*--- 5. Host frame limiting ---
+            /* DEBUG: messing with SDL delay rates - not very useful
+            //--- 5. Host frame limiting ---
             uint32_t frame_time = SDL_GetTicks() - frame_start;
             if (frame_time < 16) {
                 SDL_Delay(16 - frame_time);
-            }*/
+            }
+            */
         }
 
         // Clean up when the loop ends

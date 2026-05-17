@@ -2,6 +2,9 @@
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
 #include "HostAssetManager.hpp"
+#include <mutex>
+
+static std::mutex asset_manager_lock;
 
 namespace HLE::Android {
 
@@ -10,7 +13,6 @@ namespace HLE::Android {
         // TODO:
 
         ROUTE_REGISTER(router, "Emulator_Return_Trap", [](Dynarmic::A32::Jit* cpu) {
-            // When the game hits this SVC, tell Dynarmic to pause execution and return to main.cpp!
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined1); 
         });
         
@@ -20,6 +22,7 @@ namespace HLE::Android {
         });
 
         ROUTE_REGISTER(router, "AAssetManager_open", [&memory](Dynarmic::A32::Jit* cpu) {
+            std::lock_guard<std::mutex> lock(asset_manager_lock);
             uint32_t mgr_ptr = cpu->Regs()[0];
             uint32_t filename_ptr = cpu->Regs()[1];
             if (mgr_ptr != HostAssetManager::HANDLE_ID) {
@@ -44,55 +47,13 @@ namespace HLE::Android {
             asset.file.open(full_path, std::ios::binary | std::ios::ate);
 
             if (!asset.file.is_open()) {
-                // --- Fallback for missing -rollover variants ---
-                std::string fallback = filename;
-                size_t pos = fallback.find("-rollover");
-                if (pos != std::string::npos) {
-                    fallback.erase(pos, 9);                 // strip "-rollover"
-                    std::string fallback_path = host_assets.base_path + fallback;
-
-                    asset.file.close();                     // clean up failed stream
-                    asset.file.open(fallback_path, std::ios::binary | std::ios::ate);
-
-                    if (asset.file.is_open()) {
-                        {
-                            std::lock_guard<std::mutex> lock(console_mutex);
-                            std::cout << "[AssetManager] Fallback: " << filename
-                                      << " -> " << fallback << std::endl;
-                        }
-                        full_path = fallback_path;
-                    }
+                {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[AssetManager] FAILED to open: " << full_path << std::endl;
                 }
-                // ------------------------------------------------
-
-                                // --- Fallback 2: Check OBB / Music folder ---
-                if (!asset.file.is_open()) {
-                    asset.file.close();                     // clean up failed stream
-                    asset.file.open("./obb/" + filename, std::ios::binary | std::ios::ate);
-                }
-                if (!asset.file.is_open()) {
-                    asset.file.close();                     // clean up failed stream
-                    asset.file.open("./obb/Music/" + filename, std::ios::binary | std::ios::ate);
-                }
-                if (!asset.file.is_open()) {
-                    asset.file.close();                     // clean up failed stream
-                    asset.file.open("./obb/Sounds/" + filename, std::ios::binary | std::ios::ate);
-                }
-
-                if (!asset.file.is_open()) {
-                    asset.file.close();                     // clean up failed stream
-                    asset.file.open("./obb/Fonts/" + filename, std::ios::binary | std::ios::ate);
-                }
-
-                if (!asset.file.is_open()) {
-                    {
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "[AssetManager] FAILED to open: " << full_path << std::endl;
-                    }
-                    host_assets.open_files.erase(host_assets.next_fd);
-                    cpu->Regs()[0] = 0;
-                    return;
-                }
+                host_assets.open_files.erase(host_assets.next_fd);
+                cpu->Regs()[0] = 0;
+                return;
             }
 
             // CRITICAL: these must run for BOTH normal and fallback paths
@@ -102,6 +63,7 @@ namespace HLE::Android {
         });
 
         ROUTE_REGISTER(router, "AAsset_read", [&memory](Dynarmic::A32::Jit* cpu) {
+            std::lock_guard<std::mutex> lock(asset_manager_lock);
             uint32_t asset_ptr = cpu->Regs()[0];
             uint32_t buffer_ptr = cpu->Regs()[1];
             uint32_t count = cpu->Regs()[2];
@@ -125,14 +87,13 @@ namespace HLE::Android {
         });
 
         ROUTE_REGISTER(router, "AAsset_close", [](Dynarmic::A32::Jit* cpu) {
-            //uint32_t asset_ptr = cpu->Regs()[0];
-            //host_assets.open_files.erase(asset_ptr);
-            // The game uses this to tell Android to free the asset buffer.
-            // For now, doing absolutely nothing is the safest route to prevent 
-            // use-after-free bugs while the engine is still initializing.
+            std::lock_guard<std::mutex> lock(asset_manager_lock);
+            uint32_t asset_ptr = cpu->Regs()[0];
+            host_assets.open_files.erase(asset_ptr);
         });
 
         ROUTE_REGISTER(router, "AAsset_getLength", [](Dynarmic::A32::Jit* cpu) {
+            std::lock_guard<std::mutex> lock(asset_manager_lock);
             uint32_t asset_ptr = cpu->Regs()[0];
             if (host_assets.open_files.find(asset_ptr) != host_assets.open_files.end()) {
                 cpu->Regs()[0] = host_assets.open_files[asset_ptr].length;
@@ -142,6 +103,7 @@ namespace HLE::Android {
         });
 
         ROUTE_REGISTER(router, "AAsset_getBuffer", [&memory](Dynarmic::A32::Jit* cpu) {
+            std::lock_guard<std::mutex> lock(asset_manager_lock);
             uint32_t asset_ptr = cpu->Regs()[0];
             if (host_assets.open_files.find(asset_ptr) == host_assets.open_files.end()) {
                 cpu->Regs()[0] = 0; 
@@ -163,7 +125,7 @@ namespace HLE::Android {
                 std::memcpy(memory.GetHostPointer(asset.buffer_ptr), temp_buf.data(), asset.length);
                 memory.Write8(asset.buffer_ptr + asset.length, 0); // Safely null terminate
 
-                // --- NEW DEBUGGING ---
+                // debug print
                 {
                     std::lock_guard<std::mutex> lock(console_mutex);
                     std::cout << "[AssetManager] -> Allocated " << asset.length << " bytes for guest buffer." << std::endl;
@@ -175,13 +137,11 @@ namespace HLE::Android {
                         printf("[AssetManager] -> Magic Bytes: %02X %02X %02X %02X\n", magic[0], magic[1], magic[2], magic[3]);
                     }
                 }
-                // ---------------------
             }
             
-            cpu->Regs()[0] = asset.buffer_ptr; // Return the guest memory pointer!
+            cpu->Regs()[0] = asset.buffer_ptr;
         });
 
-        // --- Android Logging ---
         ROUTE_REGISTER(router, "__android_log_print", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t tag_ptr = cpu->Regs()[1];
             uint32_t fmt_ptr = cpu->Regs()[2];
@@ -203,7 +163,7 @@ namespace HLE::Android {
                 }
             };
 
-            // 64-bit fetch for doubles (Automatically skips odd registers for 8-byte alignment!)
+            // 64-bit fetch for doubles (Automatically skips odd registers for 8-byte alignment)
             auto get_next_arg_64 = [&]() -> uint64_t {
                 if (current_arg_reg == 3) current_arg_reg++; // Skip R3
                 if (current_stack_ptr % 8 != 0) current_stack_ptr += 4; // Align Stack
@@ -242,7 +202,6 @@ namespace HLE::Android {
                             snprintf(buf, sizeof(buf), format_spec.c_str(), d);
                             output += buf;
                         } else if (type == 'p') {
-                            // NEW: Handle pointer hex addresses!
                             snprintf(buf, sizeof(buf), "0x%08X", get_next_arg());
                             output += buf;
                         } else if (type == 's') {
@@ -267,12 +226,9 @@ namespace HLE::Android {
             cpu->Regs()[0] = 0;
         });        
 
-        // --- C++ Exception Handling ---
         ROUTE_REGISTER(router, "__gnu_Unwind_Find_exidx", [&memory](Dynarmic::A32::Jit* cpu) {
-            // R0 = return_address, R1 = int* nump
             uint32_t pcount = cpu->Regs()[1];
 
-            // Tell the C++ unwinder that there are 0 exception tables available
             if (pcount != 0) {
                 memory.Write32(pcount, 0);
             }
