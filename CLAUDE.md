@@ -47,6 +47,8 @@ The `page_table` array is handed to Dynarmic's fastmem path; `GetHostPointer` is
 
 **Threading** (`src/HLE/HLE_Threading.hpp`) spawns a real host `std::thread` for each guest `pthread_create`, allocates a fresh guest stack + TLS page, builds its own `Dynarmic::A32::Jit` with a unique `processor_id` and an `AndroidCP15` configured for that TLS, and shares the `ExclusiveMonitor` allocated in `main.cpp` (256-slot capacity). `AndroidCP15` (`src/AndroidCP15.hpp`) only implements the read of `c13, c0, opc1=0, opc2=3` (TPIDRURO) — that's how Bionic finds the per-thread TLS pointer.
 
+**`Watchpoint`** (`src/Watchpoint.hpp`) is a range-based diagnostic registry, not a feature: `HLE_Threading` adds/removes each guest pthread's stack range, `EmuCallbacks` calls `Find()` on every guest write to catch cross-thread writes into another thread's live stack, and `GuestMemory::AllocateHeap` checks `Find()` to detect heap blocks overlapping a still-live thread stack. Use it when chasing memory corruption that looks like a use-after-free or stack/heap collision.
+
 ## Boot sequence in `main.cpp`
 
 Knowing this order is essential when debugging crashes:
