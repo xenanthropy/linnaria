@@ -124,8 +124,23 @@ public:
                     std::cout << "  PC   = 0x" << std::hex << active_cpu->Regs()[15] << "\n"
                               << "  CPSR = 0x" << active_cpu->Cpsr() << std::dec << "\n";
 
-                    // DEBUG: find faulty caller
-                    std::cout << "Faulty Caller: 0x" << std::hex << Read32(0x5208cb64) << std::dec << std::endl;
+                    // DEBUG: walk live SP, dump 24 words. Thumb-bit-set values in
+                    // the .text range are likely saved LRs (caller return addresses).
+                    uint32_t sp = active_cpu->Regs()[13];
+                    std::cout << "  Stack dump (24 words from SP=0x" << std::hex << sp << "):\n" << std::dec;
+                    for (uint32_t off = 0; off < 24 * 4; off += 4) {
+                        uint32_t addr = sp + off;
+                        if (addr < CODE_BASE || addr + 4 > CODE_BASE + MEMORY_SIZE) {
+                            std::cout << "    [SP+0x" << std::hex << off << "] OOB" << std::dec << "\n";
+                            continue;
+                        }
+                        uint32_t val;
+                        std::memcpy(&val, fastmem_base + addr, 4);
+                        bool looks_like_lr = (val & 1) && (val >= CODE_BASE) && (val < CODE_BASE + 0x800000);
+                        std::cout << "    [SP+0x" << std::hex << off << "] = 0x" << val << std::dec;
+                        if (looks_like_lr) std::cout << "  <-- likely saved LR (Thumb)";
+                        std::cout << "\n";
+                    }
                 } else {
                     std::cout << "  (active_cpu is null, cannot dump registers)\n";
                 }
