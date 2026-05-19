@@ -5,6 +5,7 @@
 #include "EmuCallbacks.hpp"
 #include "AndroidCP15.hpp"
 #include "ThreadingHelpers.hpp"
+#include "CPUHelper.hpp"
 #include "Watchpoint.hpp"
 
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -89,6 +90,9 @@ namespace HLE::Threading {
 
                 Dynarmic::A32::Jit thread_cpu(config);
                 callbacks.cpu = &thread_cpu;
+                // change active CPU and thread
+                active_cpu = &thread_cpu;
+                active_thread_id = core_id;
 
                 // Setup initial Registers
                 thread_cpu.Regs()[13] = sp;
@@ -103,7 +107,7 @@ namespace HLE::Threading {
 
                     // Check if the CPU halted because it reached our exit SVC
                     if (halt == Dynarmic::HaltReason::UserDefined1 &&
-                        thread_cpu.Regs()[15] == (loader.GetThunk("pthread_exit") & ~1)) {
+                        thread_cpu.Regs()[15] == 0xFFFFFFFE) {
                         break; // Clean exit
                     }
 
@@ -151,12 +155,14 @@ namespace HLE::Threading {
         });
 
         ROUTE_REGISTER(router, "pthread_exit",[](Dynarmic::A32::Jit* cpu) {
+            // Set a magic PC so the host loop knows to terminate this thread cleanly
+            cpu->Regs()[15] = 0xFFFFFFFE;
             // Safely break out of the CPU loop.
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined1);
         });
 
         ROUTE_REGISTER(router, "pthread_self", [](Dynarmic::A32::Jit* cpu) {
-            cpu->Regs()[0] = 1; // Return a dummy thread ID
+            cpu->Regs()[0] = active_thread_id; // Return our thread_local created id
         });
 
         ROUTE_REGISTER(router, "pthread_once", [&](Dynarmic::A32::Jit* cpu) {

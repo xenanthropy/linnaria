@@ -1,4 +1,6 @@
 #pragma once
+#include "GuestMemory.hpp"
+#include "CPUHelper.hpp"
 #include <string>
 #include <unordered_map>
 #include <functional>
@@ -44,7 +46,8 @@ public:
             */
             {
                 std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[TID: " << std::this_thread::get_id() << "] Executing: " << name << "\n";
+                //std::cout << "[TID: " << std::this_thread::get_id() << "] Executing: " << name << "\n";
+                std::cout << "[Thread " << active_thread_id << "] Executing: " << name << "\n";
             }
             it->second.handler(cpu);
         } else {

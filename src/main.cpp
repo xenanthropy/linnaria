@@ -11,13 +11,18 @@
 #include "AndroidCP15.hpp"
 #include "AndroidEnvironment.hpp"
 #include "ThreadingHelpers.hpp"
+#include "CPUHelper.hpp"
 #include "Watchpoint.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
+#include <dynarmic/interface/A32/a32.h>
 
 #include <SDL2/SDL.h>
 #include <glad/gles2.h>
+
+thread_local Dynarmic::A32::Jit* active_cpu = nullptr;
+thread_local uint32_t active_thread_id = 0;
 
 void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader& loader, 
                          const std::string& func_name, const std::vector<uint32_t>& args) {
@@ -217,6 +222,7 @@ int main(int argc, char** argv) {
 
         config.global_monitor = &monitor;
         config.processor_id = 0; // Main Thread is Core 0
+        active_thread_id = 0;
         uint32_t main_tls = memory.AllocateHeap(4096);
         config.coprocessors[15] = std::make_shared<AndroidCP15>(main_tls);
 
@@ -226,6 +232,8 @@ int main(int argc, char** argv) {
         
         Dynarmic::A32::Jit cpu(config);
         callbacks.cpu = &cpu;
+        // assign active cpu to CPUhelper
+        active_cpu = &cpu;
 
         // Register the main thread's guest stack range. The main JIT's initial SP
         // is GuestMemory::CODE_BASE + MEMORY_SIZE - 0x100000 (0x7FFF0000) and grows

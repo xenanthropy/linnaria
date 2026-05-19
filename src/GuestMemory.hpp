@@ -1,5 +1,7 @@
 #pragma once
 #include <SyscallRouter.hpp>
+#include <CPUHelper.hpp>
+#include <cstdlib>
 #include <vector>
 #include <array>
 #include <cstdint>
@@ -112,17 +114,48 @@ public:
         if (vaddr >= 0xEF000000 && vaddr < 0xEF010000) return fastmem_base + vaddr;
         
         if (vaddr < CODE_BASE || vaddr >= CODE_BASE + MEMORY_SIZE) {
+            {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "\n[CRASH TRAP] OOB in GetHostPointer: 0x" << std::hex << vaddr << std::dec << "!\n";
+                if (active_cpu) {
+                    for (int i = 0; i < 15; i++) {
+                        std::cout << "  R" << i << " = 0x" << std::hex << active_cpu->Regs()[i] << std::dec << "\n";
+                    }
+                    std::cout << "  PC   = 0x" << std::hex << active_cpu->Regs()[15] << "\n"
+                              << "  CPSR = 0x" << active_cpu->Cpsr() << std::dec << "\n";
+
+                    // DEBUG: find faulty caller
+                    std::cout << "Faulty Caller: 0x" << std::hex << Read32(0x5208cb64) << std::dec << std::endl;
+                } else {
+                    std::cout << "  (active_cpu is null, cannot dump registers)\n";
+                }
+
+                std::exit(1);
+            }
+            /*
             std::lock_guard<std::mutex> lock(console_mutex);
             std::cout << "[Memory] WARNING: Out of bounds access at 0x" << std::hex << vaddr << std::dec << std::endl;
             //std::cerr << "[Memory] WARNING: Out of bounds access at 0x" << std::hex << vaddr << std::dec << std::endl;
             dummy_memory = 0;
             return reinterpret_cast<uint8_t*>(&dummy_memory);
+            */
         }
         return fastmem_base + vaddr;
     }
 
     uint8_t Read8(uint32_t vaddr) { return *GetHostPointer(vaddr); }
     void Write8(uint32_t vaddr, uint8_t val) { *GetHostPointer(vaddr) = val; }
+
+    uint16_t Read16(uint32_t vaddr) {
+        uint16_t* ptr = reinterpret_cast<uint16_t*>(GetHostPointer(vaddr));
+        return *ptr;
+    }
+
+    void Write16(uint32_t vaddr, uint16_t val) {
+        uint16_t* ptr = reinterpret_cast<uint16_t*>(GetHostPointer(vaddr));
+        *ptr = val;
+    }
+
     void Write32(uint32_t vaddr, uint32_t val) {
         uint32_t* ptr = reinterpret_cast<uint32_t*>(GetHostPointer(vaddr));
         *ptr = val;
