@@ -63,16 +63,30 @@ namespace HLE::Time {
                 return;
             }
 
-            // Read the 32‑bit time_t value from guest memory
             time_t raw_time = static_cast<time_t>(memory.Read32(time_ptr));
 
-            // Get a host pointer to the struct tm in guest memory
-            struct tm* host_result = reinterpret_cast<struct tm*>(memory.GetHostPointer(result_ptr));
+            // DO NOT pass the guest struct tm directly to host gmtime_r:
+            // host glibc tm = 56 bytes (long/ptr = 8B), Bionic guest tm = 44 bytes
+            // (long/ptr = 4B). Writing host-sized struct would overflow by 12B and
+            // mis-place tm_gmtoff (guest 36 vs host 40) and tm_zone (guest 40 vs host 48).
+            struct tm host_tm{};
+            if (gmtime_r(&raw_time, &host_tm) == nullptr) {
+                cpu->Regs()[0] = 0;
+                return;
+            }
 
-            // Call the host gmtime_r – fills the struct in guest memory
-            gmtime_r(&raw_time, host_result);
+            memory.Write32(result_ptr + 0,  static_cast<uint32_t>(host_tm.tm_sec));
+            memory.Write32(result_ptr + 4,  static_cast<uint32_t>(host_tm.tm_min));
+            memory.Write32(result_ptr + 8,  static_cast<uint32_t>(host_tm.tm_hour));
+            memory.Write32(result_ptr + 12, static_cast<uint32_t>(host_tm.tm_mday));
+            memory.Write32(result_ptr + 16, static_cast<uint32_t>(host_tm.tm_mon));
+            memory.Write32(result_ptr + 20, static_cast<uint32_t>(host_tm.tm_year));
+            memory.Write32(result_ptr + 24, static_cast<uint32_t>(host_tm.tm_wday));
+            memory.Write32(result_ptr + 28, static_cast<uint32_t>(host_tm.tm_yday));
+            memory.Write32(result_ptr + 32, static_cast<uint32_t>(host_tm.tm_isdst));
+            memory.Write32(result_ptr + 36, 0); // tm_gmtoff (UTC)
+            memory.Write32(result_ptr + 40, 0); // tm_zone (null)
 
-            // Return the guest pointer to the result (success)
             cpu->Regs()[0] = result_ptr;
         });
 

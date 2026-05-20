@@ -117,6 +117,8 @@ public:
             {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "\n[CRASH TRAP] OOB in GetHostPointer: 0x" << std::hex << vaddr << std::dec << "!\n";
+                std::cout << "  active_thread_id=" << active_thread_id
+                          << "  host_tid=" << Watchpoint::TidString(std::this_thread::get_id()) << "\n";
                 if (active_cpu) {
                     for (int i = 0; i < 15; i++) {
                         std::cout << "  R" << i << " = 0x" << std::hex << active_cpu->Regs()[i] << std::dec << "\n";
