@@ -175,6 +175,9 @@ int main(int argc, char** argv) {
         // Create the OpenGL Context so our host GPU can receive commands
         SDL_GLContext gl_context = SDL_GL_CreateContext(window);
 
+        // We own pacing in software (see main loop below); don't let SwapWindow block.
+        SDL_GL_SetSwapInterval(0);
+
         int glad_result = gladLoadGLES2((GLADloadfunc)SDL_GL_GetProcAddress);
         if (!glad_result) {
             printf("Failed to initialize GLAD\n");
@@ -359,17 +362,37 @@ int main(int argc, char** argv) {
         main_thread.regs[3] = 1;
         ///////////////////////////////////
 
-        while (running) {
-            uint32_t frame_start = SDL_GetTicks();
+        // Pacing config (Hz; 0 = uncapped). Tick = how often the guest gets to run
+        // a nativeOnUpdate slice; Display = how often we present the back buffer.
+        // Boot defaults: tick uncapped (fast asset load), display ~60 Hz (steady).
+        uint32_t game_tick_hz = 0;
+        uint32_t display_hz   = 60;
 
+        uint32_t last_tick = SDL_GetTicks();
+        uint32_t last_swap = SDL_GetTicks();
+
+        while (running) {
             // --- 1. Host events ---
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT) running = false;
+                else if (event.type == SDL_KEYDOWN) {
+                    switch (event.key.keysym.sym) {
+                        case SDLK_F1: game_tick_hz = 0;   break;
+                        case SDLK_F2: game_tick_hz = 60;  break;
+                        case SDLK_F3: display_hz   = 0;   break;
+                        case SDLK_F4: display_hz   = 60;  break;
+                        default: break;
+                    }
+                }
             }
 
-            // --- 2. Run Main Thread Slice ---
-            if (main_thread.is_alive) {
+            uint32_t now = SDL_GetTicks();
+            bool tick_due = (game_tick_hz == 0) || (now - last_tick >= 1000u / game_tick_hz);
+            bool swap_due = (display_hz   == 0) || (now - last_swap >= 1000u / display_hz);
+
+            // --- 2. Run Main Thread Slice (if tick budget is due) ---
+            if (tick_due && main_thread.is_alive) {
                 // Restore
                 for (int r = 0; r < 16; r++) cpu.Regs()[r] = main_thread.regs[r];
                 cpu.SetCpsr(main_thread.cpsr);
@@ -399,8 +422,7 @@ int main(int argc, char** argv) {
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined2) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
-                    // Just yield briefly if the main thread asks to sleep
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    // Loop's idle-yield below handles the sleep; nothing to do here.
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined3) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
@@ -416,18 +438,20 @@ int main(int argc, char** argv) {
                         main_thread.cpsr = cpu.Cpsr();
                     }
                 }
+
+                last_tick = now;
             }
 
-            // --- 4. Present Frame ---
-            SDL_GL_SwapWindow(window);
-
-            /* DEBUG: messing with SDL delay rates - not very useful
-            //--- 5. Host frame limiting ---
-            uint32_t frame_time = SDL_GetTicks() - frame_start;
-            if (frame_time < 16) {
-                SDL_Delay(16 - frame_time);
+            // --- 3. Present (if swap budget is due) ---
+            if (swap_due) {
+                SDL_GL_SwapWindow(window);
+                last_swap = now;
             }
-            */
+
+            // --- 4. Idle yield: don't pin a core when nothing's due ---
+            if (!tick_due && !swap_due) {
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
         }
 
         // Clean up when the loop ends
