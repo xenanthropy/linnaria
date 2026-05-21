@@ -13,6 +13,7 @@
 #include "ThreadingHelpers.hpp"
 #include "CPUHelper.hpp"
 #include "Watchpoint.hpp"
+#include "Pacing.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -362,11 +363,10 @@ int main(int argc, char** argv) {
         main_thread.regs[3] = 1;
         ///////////////////////////////////
 
-        // Pacing config (Hz; 0 = uncapped). Tick = how often the guest gets to run
-        // a nativeOnUpdate slice; Display = how often we present the back buffer.
+        // Pacing rates live in Pacing.hpp so HLE modules can flip them in
+        // response to guest events (e.g., the Octarine achievement-system log
+        // line bumps game_tick_hz to 60 once boot is past asset extraction).
         // Boot defaults: tick uncapped (fast asset load), display ~60 Hz (steady).
-        uint32_t game_tick_hz = 0;
-        uint32_t display_hz   = 60;
 
         uint32_t last_tick = SDL_GetTicks();
         uint32_t last_swap = SDL_GetTicks();
@@ -378,15 +378,17 @@ int main(int argc, char** argv) {
                 if (event.type == SDL_QUIT) running = false;
                 else if (event.type == SDL_KEYDOWN) {
                     switch (event.key.keysym.sym) {
-                        case SDLK_F1: game_tick_hz = 0;   break;
-                        case SDLK_F2: game_tick_hz = 60;  break;
-                        case SDLK_F3: display_hz   = 0;   break;
-                        case SDLK_F4: display_hz   = 60;  break;
+                        case SDLK_F1: Pacing::game_tick_hz.store(0);  break;
+                        case SDLK_F2: Pacing::game_tick_hz.store(60); break;
+                        case SDLK_F3: Pacing::display_hz.store(0);    break;
+                        case SDLK_F4: Pacing::display_hz.store(60);   break;
                         default: break;
                     }
                 }
             }
 
+            uint32_t game_tick_hz = Pacing::game_tick_hz.load();
+            uint32_t display_hz   = Pacing::display_hz.load();
             uint32_t now = SDL_GetTicks();
             bool tick_due = (game_tick_hz == 0) || (now - last_tick >= 1000u / game_tick_hz);
             bool swap_due = (display_hz   == 0) || (now - last_swap >= 1000u / display_hz);

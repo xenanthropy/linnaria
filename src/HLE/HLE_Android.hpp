@@ -2,6 +2,7 @@
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
 #include "HostAssetManager.hpp"
+#include "Pacing.hpp"
 #include <mutex>
 
 static std::mutex asset_manager_lock;
@@ -226,8 +227,21 @@ namespace HLE::Android {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[Android Log] " << tag << ": " << output << std::endl;
             }
+
+            // Boot-state trigger: once the Octarine engine reports the
+            // achievement system is up, we're past asset extraction and into
+            // the splash sequence proper. Cap nativeOnUpdate at 60 Hz from
+            // here so gameplay logic runs at original-device speed instead of
+            // whatever the JIT can sustain. One-shot.
+            static bool tick_cap_armed = false;
+            if (!tick_cap_armed &&
+                output.find("Initialized achievement system") != std::string::npos) {
+                Pacing::game_tick_hz.store(60);
+                tick_cap_armed = true;
+            }
+
             cpu->Regs()[0] = 0;
-        });        
+        });
 
         ROUTE_REGISTER(router, "__gnu_Unwind_Find_exidx", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t pcount = cpu->Regs()[1];
