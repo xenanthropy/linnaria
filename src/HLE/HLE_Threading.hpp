@@ -47,7 +47,50 @@ namespace HLE::Threading {
         ROUTE_REGISTER(router, "pthread_mutex_init", pthread_success);
         ROUTE_REGISTER(router, "pthread_cond_init", pthread_success);
 
-        ROUTE_REGISTER(router, "pthread_key_create", pthread_success);
+        // pthread_key_create previously stubbed to pthread_success, which
+        // returned 0 but never wrote the key value -- the guest's
+        // pthread_key_t local was left uninitialized and every subsequent
+        // setspecific/getspecific operated on garbage. Allocate a fresh
+        // sequential ID and write it through the out-pointer.
+        static std::atomic<uint32_t> next_pthread_key{1};
+        ROUTE_REGISTER(router, "pthread_key_create", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t key_ptr = cpu->Regs()[0];
+            // R1 is the destructor (uint32_t func ptr). We don't run TLS
+            // destructors at host-thread exit -- close enough for now.
+            uint32_t new_key = next_pthread_key.fetch_add(1);
+            if (key_ptr) memory.Write32(key_ptr, new_key);
+            cpu->Regs()[0] = 0;
+        });
+
+        // Per-host-thread storage for pthread keys. thread_local in the
+        // lambda body means each guest pthread (which runs on its own host
+        // std::thread) sees its own map. The main thread gets one too.
+        auto get_tls = []() -> std::unordered_map<uint32_t, uint32_t>& {
+            thread_local std::unordered_map<uint32_t, uint32_t> t;
+            return t;
+        };
+
+        ROUTE_REGISTER(router, "pthread_setspecific", [get_tls](Dynarmic::A32::Jit* cpu) {
+            uint32_t key = cpu->Regs()[0];
+            uint32_t val = cpu->Regs()[1];
+            get_tls()[key] = val;
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_getspecific", [get_tls](Dynarmic::A32::Jit* cpu) {
+            uint32_t key = cpu->Regs()[0];
+            auto& m = get_tls();
+            auto it = m.find(key);
+            cpu->Regs()[0] = (it != m.end()) ? it->second : 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_key_delete", [](Dynarmic::A32::Jit* cpu) {
+            // No cleanup across threads -- the per-thread entry just hangs
+            // around. Safe to ignore: future setspecific on a reused key
+            // simply overwrites the slot.
+            cpu->Regs()[0] = 0;
+        });
+
         ROUTE_REGISTER(router, "pthread_setname_np", pthread_success);
 
 
@@ -226,6 +269,18 @@ namespace HLE::Threading {
             }
             m->lock(); // Block natively
             cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_mutex_trylock",[](Dynarmic::A32::Jit* cpu) {
+            uint32_t mutex_ptr = cpu->Regs()[0];
+            std::shared_ptr<std::recursive_mutex> m;
+            {
+                std::lock_guard<std::mutex> lock(host_mutex_lock);
+                auto& slot = host_mutexes[mutex_ptr];
+                if (!slot) slot = std::make_shared<std::recursive_mutex>();
+                m = slot;
+            }
+            cpu->Regs()[0] = m->try_lock() ? 0 : 16 /* EBUSY */;
         });
 
         ROUTE_REGISTER(router, "pthread_mutex_unlock",[](Dynarmic::A32::Jit* cpu) {
