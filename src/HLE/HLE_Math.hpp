@@ -8,8 +8,14 @@ namespace HLE::Math {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
 
-        //TODO: acosf, asinf, atan2f, cos, sin, tanf, exp, fabsf, ceil, frexp, modf, modff
+        //TODO: acosf, asinf, atan2f, cos, sin, tanf, exp, ceil, frexp, modf, modff
         //      log, pow, powf
+
+        ROUTE_REGISTER(router, "fabsf", [](Dynarmic::A32::Jit* cpu) {
+            // bit-clear of the sign bit -- correct for normals, denormals,
+            // zeros, and infinities. (NaN preservation isn't important here.)
+            cpu->Regs()[0] = cpu->Regs()[0] & 0x7FFFFFFFu;
+        });
 
         ROUTE_REGISTER(router, "cosf", [](Dynarmic::A32::Jit* cpu) {
             uint32_t raw_in = cpu->Regs()[0];

@@ -379,7 +379,10 @@ int main(int argc, char** argv) {
         // True when main_thread is between native calls (last halt was
         // UserDefined1). Used to gate Input::DrainPending so we don't
         // re-use the stack while a guest function is paused on it.
-        bool main_thread_clean = true;
+        // Starts false: even if Pacing::input_enabled were forced true
+        // before any tick has run, this keeps us from dispatching into a
+        // game that hasn't completed its first nativeOnUpdate yet.
+        bool main_thread_clean = false;
 
         while (running) {
             // --- 1. Host events ---

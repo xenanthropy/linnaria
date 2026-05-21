@@ -33,6 +33,7 @@ namespace HLE::OpenGL {
         ROUTE_REGISTER(router, "glUniform1i", [](Dynarmic::A32::Jit* cpu) { glUniform1i(cpu->Regs()[0], cpu->Regs()[1]); });
         ROUTE_REGISTER(router, "glTexParameteri", [](Dynarmic::A32::Jit* cpu) { glTexParameteri(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2]); });
         ROUTE_REGISTER(router, "glViewport", [](Dynarmic::A32::Jit* cpu) { glViewport(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
+        ROUTE_REGISTER(router, "glScissor",  [](Dynarmic::A32::Jit* cpu) { glScissor (cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
         ROUTE_REGISTER(router, "glCreateShader", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = glCreateShader(cpu->Regs()[0]); });
         ROUTE_REGISTER(router, "glCreateProgram", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = glCreateProgram(); });
         ROUTE_REGISTER(router, "glDetachShader", [](Dynarmic::A32::Jit* cpu) { glDetachShader(cpu->Regs()[0], cpu->Regs()[1]); });

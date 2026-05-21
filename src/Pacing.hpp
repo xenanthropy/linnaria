@@ -17,4 +17,11 @@ namespace Pacing {
     // between the latest drawn frame and whatever stale content sits in the
     // other half of the double-buffer.
     inline std::atomic<bool> frame_dirty{false};
+
+    // Gate for SDL input -> native dispatch. Flipped true by the HLE_Android
+    // log trigger when "TerrariaInitializer::Run() DONE" fires, which is
+    // when the main menu has finished initializing and the game is ready
+    // to receive touch/key events. Before that, the splash sequence is
+    // still wiring up handler state and dispatching to it crashes.
+    inline std::atomic<bool> input_enabled{false};
 }

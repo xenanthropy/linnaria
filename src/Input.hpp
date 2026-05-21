@@ -6,6 +6,7 @@
 #include <string>
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
+#include "Pacing.hpp"
 #include <dynarmic/interface/A32/a32.h>
 
 // Forward decl -- actual definition lives in main.cpp. verbose=false
@@ -88,8 +89,17 @@ namespace Input {
     }
 
     // Translate one SDL event into a queued action. Safe to call any time;
-    // does not touch guest state.
+    // does not touch guest state. Events are dropped (not queued) until the
+    // game finishes booting -- see Pacing::input_enabled.
     inline void HandleSDLEvent(const SDL_Event& ev) {
+        if (!Pacing::input_enabled.load(std::memory_order_relaxed)) {
+            // Make sure we don't strand mouse_held=true if the user clicked
+            // mid-boot: a stale "held" would synthesize a phantom MOVE the
+            // instant input enables.
+            if (ev.type == SDL_MOUSEBUTTONUP) mouse_held = false;
+            return;
+        }
+
         // The Java side passes 1000 / event.getEventTime() as the 5th arg
         // to nativeTouchEvent. Mirror that here so the guest sees a value
         // in the same shape, even if the game ends up ignoring it.

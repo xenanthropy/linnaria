@@ -58,6 +58,7 @@ public:
         mem.Write32(table_ptr + (33 * 4), loader.GetThunk("JNI_GetMethodID"));
         mem.Write32(table_ptr + (80 * 4), loader.GetThunk("JNI_CallNonvirtualIntMethodV"));
         mem.Write32(table_ptr + (92 * 4), loader.GetThunk("JNI_CallNonvirtualVoidMethodV"));
+        mem.Write32(table_ptr + (118 * 4), loader.GetThunk("JNI_CallStaticBooleanMethodV"));
         mem.Write32(table_ptr + (130 * 4), loader.GetThunk("JNI_CallStaticIntMethodV"));
         mem.Write32(table_ptr + (169 * 4), loader.GetThunk("JNI_GetStringUTFChars"));
         mem.Write32(table_ptr + (170 * 4), loader.GetThunk("JNI_ReleaseStringUTFChars"));
@@ -95,6 +96,13 @@ public:
 
         ROUTE_REGISTER(router, "JNI_CallStaticVoidMethodV", [](Dynarmic::A32::Jit* cpu) {
             // No-op: the Java method doesn't exist on the host anyway
+        });
+
+        // Boolean-returning static calls (e.g. OctarineBridge::GoogleSignedIn())
+        // -- we have no Java to dispatch to, so always return false. Silences
+        // the [JNI] unimplemented warning at slot 118.
+        ROUTE_REGISTER(router, "JNI_CallStaticBooleanMethodV", [](Dynarmic::A32::Jit* cpu) {
+            cpu->Regs()[0] = 0;
         });
 
         ROUTE_REGISTER(router, "JNI_GetPrimitiveArrayCritical", [&mem](Dynarmic::A32::Jit* cpu) {

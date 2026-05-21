@@ -237,6 +237,17 @@ namespace HLE::Android {
                 tick_cap_armed = true;
             }
 
+            // Input gate: TerrariaInitializer::Run() finishes when the main
+            // menu is fully constructed and the touch/key handlers are wired
+            // up. Dispatching SDL events before this point crashes the game
+            // (the splash sequence hasn't allocated the input handler state).
+            static bool input_armed = false;
+            if (!input_armed &&
+                output.find("TerrariaInitializer::Run() DONE") != std::string::npos) {
+                Pacing::input_enabled.store(true);
+                input_armed = true;
+            }
+
             cpu->Regs()[0] = 0;
         });
 
