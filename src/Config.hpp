@@ -69,6 +69,14 @@ namespace Config {
             "RespondToTouchTrack",
             "TapCount:",
         };
+
+        // Verbose mutex / CV trace, ungated by the functionCalls toggle.
+        // When on, every pthread_mutex_{lock,trylock,unlock} and
+        // pthread_cond_{wait,timedwait,signal,broadcast,destroy} prints a
+        // line including the guest pointer and (for lock/unlock) the
+        // calling thread id. Use this to diagnose deadlocks: grep by
+        // pointer to see the full lifecycle of a single mutex.
+        inline constexpr bool mutexTrace = false;
     }
 
 }

@@ -267,7 +267,15 @@ namespace HLE::Threading {
                 if (!host_mutexes[mutex_ptr]) host_mutexes[mutex_ptr] = std::make_shared<std::recursive_mutex>();
                 m = host_mutexes[mutex_ptr];
             }
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] mutex_lock   waiting 0x" << std::hex << mutex_ptr << std::dec << "\n";
+            }
             m->lock(); // Block natively
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] mutex_lock   ACQUIRED 0x" << std::hex << mutex_ptr << std::dec << "\n";
+            }
             cpu->Regs()[0] = 0;
         });
 
@@ -280,7 +288,12 @@ namespace HLE::Threading {
                 if (!slot) slot = std::make_shared<std::recursive_mutex>();
                 m = slot;
             }
-            cpu->Regs()[0] = m->try_lock() ? 0 : 16 /* EBUSY */;
+            bool got = m->try_lock();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] mutex_trylock " << (got ? "OK " : "EBUSY ") << "0x" << std::hex << mutex_ptr << std::dec << "\n";
+            }
+            cpu->Regs()[0] = got ? 0 : 16 /* EBUSY */;
         });
 
         ROUTE_REGISTER(router, "pthread_mutex_unlock",[](Dynarmic::A32::Jit* cpu) {
@@ -291,6 +304,10 @@ namespace HLE::Threading {
                 m = host_mutexes[mutex_ptr];
             }
             if (m) m->unlock();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] mutex_unlock          0x" << std::hex << mutex_ptr << std::dec << "\n";
+            }
             cpu->Regs()[0] = 0;
         });
 
@@ -331,26 +348,43 @@ namespace HLE::Threading {
         });
 
         ROUTE_REGISTER(router, "pthread_cond_signal", [get_cv](Dynarmic::A32::Jit* cpu) {
-            auto cv = get_cv(cpu->Regs()[0]);
+            uint32_t cv_ptr = cpu->Regs()[0];
+            auto cv = get_cv(cv_ptr);
             cv->notify_one();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_signal           cv=0x" << std::hex << cv_ptr << std::dec << "\n";
+            }
             cpu->Regs()[0] = 0;
         });
 
         ROUTE_REGISTER(router, "pthread_cond_broadcast", [get_cv](Dynarmic::A32::Jit* cpu) {
-            auto cv = get_cv(cpu->Regs()[0]);
+            uint32_t cv_ptr = cpu->Regs()[0];
+            auto cv = get_cv(cv_ptr);
             cv->notify_all();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_broadcast        cv=0x" << std::hex << cv_ptr << std::dec << "\n";
+            }
             cpu->Regs()[0] = 0;
         });
 
         ROUTE_REGISTER(router, "pthread_cond_wait", [get_cv, get_mutex](Dynarmic::A32::Jit* cpu) {
-            auto cv = get_cv(cpu->Regs()[0]);
-            auto m  = get_mutex(cpu->Regs()[1]);
-            // The guest already holds the mutex (pthread_mutex_lock was
-            // called before this). adopt_lock + release at the end keeps
-            // it held across the wait/wake cycle, which is the contract.
+            uint32_t cv_ptr    = cpu->Regs()[0];
+            uint32_t mutex_ptr = cpu->Regs()[1];
+            auto cv = get_cv(cv_ptr);
+            auto m  = get_mutex(mutex_ptr);
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_wait    enter    cv=0x" << std::hex << cv_ptr << " mutex=0x" << mutex_ptr << std::dec << "\n";
+            }
             std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
             cv->wait(lock);
             lock.release();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock2(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_wait    woke     cv=0x" << std::hex << cv_ptr << std::dec << "\n";
+            }
             cpu->Regs()[0] = 0;
         });
 
@@ -362,8 +396,6 @@ namespace HLE::Threading {
             auto cv = get_cv(cv_ptr);
             auto m  = get_mutex(mutex_ptr);
 
-            // Bionic abstime is CLOCK_REALTIME-based (struct timespec).
-            // Convert to a system_clock time_point for wait_until.
             std::chrono::time_point<std::chrono::system_clock> deadline;
             if (abstime_ptr) {
                 int64_t tv_sec  = static_cast<int32_t>(memory.Read32(abstime_ptr));
@@ -375,9 +407,17 @@ namespace HLE::Threading {
                 deadline = std::chrono::system_clock::now();
             }
 
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_tw      enter    cv=0x" << std::hex << cv_ptr << " mutex=0x" << mutex_ptr << std::dec << "\n";
+            }
             std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
             auto status = cv->wait_until(lock, deadline);
             lock.release();
+            if constexpr (Config::Prints::mutexTrace) {
+                std::lock_guard<std::mutex> lock2(console_mutex);
+                std::cout << "[Thread " << active_thread_id << "] cond_tw      " << (status == std::cv_status::timeout ? "TIMEOUT" : "SIGNAL ") << "  cv=0x" << std::hex << cv_ptr << std::dec << "\n";
+            }
 
             cpu->Regs()[0] = (status == std::cv_status::timeout) ? 110 /* ETIMEDOUT */ : 0;
         });
