@@ -1,6 +1,7 @@
 #pragma once
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
+#include "Config.hpp"
 
 #include <zlib.h>
 #include <mutex>
@@ -90,7 +91,7 @@ namespace HLE::Zlib {
             memory.Write32(stream_ptr + Z32_TOTAL_OUT, static_cast<uint32_t>(zs->total_out));
             memory.Write32(stream_ptr + Z32_ADLER,     static_cast<uint32_t>(zs->adler));
 
-            {
+            if constexpr (Config::Prints::zlib) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[zlib] inflate(flush=" << flush << ") | "
                           << "IN: " << oai << " (used " << consumed << ") | "

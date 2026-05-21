@@ -3,6 +3,7 @@
 #include "GuestMemory.hpp"
 #include "HostAssetManager.hpp"
 #include "Pacing.hpp"
+#include "Config.hpp"
 #include <mutex>
 
 static std::mutex asset_manager_lock;
@@ -40,7 +41,7 @@ namespace HLE::Android {
             }
 
             std::string full_path = host_assets.base_path + filename;
-            {
+            if constexpr (Config::Prints::assetManager) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[AssetManager] Opening: " << full_path << std::endl;
             }
@@ -48,7 +49,7 @@ namespace HLE::Android {
             asset.file.open(full_path, std::ios::binary | std::ios::ate);
 
             if (!asset.file.is_open()) {
-                {
+                if constexpr (Config::Prints::assetManager) {
                     std::lock_guard<std::mutex> lock(console_mutex);
                     std::cout << "[AssetManager] FAILED to open: " << full_path << std::endl;
                 }
@@ -129,15 +130,11 @@ namespace HLE::Android {
                 std::memcpy(memory.GetHostPointer(asset.buffer_ptr), temp_buf.data(), asset.length);
                 memory.Write8(asset.buffer_ptr + asset.length, 0); // Safely null terminate
 
-                // debug print
-                {
+                if constexpr (Config::Prints::assetManager) {
                     std::lock_guard<std::mutex> lock(console_mutex);
                     std::cout << "[AssetManager] -> Allocated " << asset.length << " bytes for guest buffer." << std::endl;
-                }
-                if (asset.length >= 4) {
-                    uint8_t* magic = memory.GetHostPointer(asset.buffer_ptr);
-                    {
-                        std::lock_guard<std::mutex> lock(console_mutex);                    
+                    if (asset.length >= 4) {
+                        uint8_t* magic = memory.GetHostPointer(asset.buffer_ptr);
                         printf("[AssetManager] -> Magic Bytes: %02X %02X %02X %02X\n", magic[0], magic[1], magic[2], magic[3]);
                     }
                 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "GuestMemory.hpp"
 #include "CPUHelper.hpp"
+#include "Config.hpp"
 #include <string>
 #include <unordered_map>
 #include <functional>
@@ -44,9 +45,8 @@ public:
                 std::cout << "[Router] Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
                 OPTIONAL: Uncomment to see successful calls
             */
-            {
+            if constexpr (Config::Prints::functionCalls) {
                 std::lock_guard<std::mutex> lock(console_mutex);
-                //std::cout << "[TID: " << std::this_thread::get_id() << "] Executing: " << name << "\n";
                 std::cout << "[Thread " << active_thread_id << "] Executing: " << name << "\n";
             }
             it->second.handler(cpu);

@@ -1,6 +1,7 @@
 #pragma once
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
+#include "Config.hpp"
 #include <unistd.h>
 #include <filesystem>
 #include <sys/uio.h>
@@ -48,7 +49,7 @@ namespace HLE::VFS {
                 memory.Write8(guest_file + i + 1, (fd16 >> 8) & 0xFF);
             }
 
-            {
+            if constexpr (Config::Prints::vfs) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[VFS] fopen guest_file=0x" << std::hex << guest_file
                           << " fd=" << fd << " path=" << path << std::dec << std::endl;
@@ -100,7 +101,7 @@ namespace HLE::VFS {
 
             std::lock_guard<std::mutex> lock(file_mutex);
 
-            {
+            if constexpr (Config::Prints::vfs) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[VFS] fwrite handle=" << handle << " size=" << size << " nmemb=" << nmemb << std::endl;
             }
@@ -146,7 +147,9 @@ namespace HLE::VFS {
                     // Clamp to valid range
                     if (pos > content.size()) pos = content.size();
                     cpu->Regs()[0] = static_cast<uint32_t>(pos);
-                    std::cout << "[VFS] lseek fake fd=" << fd << " -> pos=" << pos << std::endl;
+                    if constexpr (Config::Prints::vfs) {
+                        std::cout << "[VFS] lseek fake fd=" << fd << " -> pos=" << pos << std::endl;
+                    }
                     return;
                 }
             }
@@ -225,7 +228,9 @@ namespace HLE::VFS {
                     std::memcpy(memory.GetHostPointer(buf), content.data() + pos, to_copy);
                     pos += to_copy;
                     cpu->Regs()[0] = static_cast<uint32_t>(to_copy);
-                    std::cout << "[VFS] read fake fd=" << fd << " returned " << to_copy << " bytes" << std::endl;
+                    if constexpr (Config::Prints::vfs) {
+                        std::cout << "[VFS] read fake fd=" << fd << " returned " << to_copy << " bytes" << std::endl;
+                    }
                     return;
                 }
             }
@@ -281,7 +286,7 @@ namespace HLE::VFS {
                     fake_files[fd] = content;
                     fake_file_pos[fd] = 0;
                     cpu->Regs()[0] = fd;
-                    std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                    if constexpr (Config::Prints::vfs) std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
                     return;
             }
             if (strcmp(path, "/sys/devices/system/cpu/present") == 0) {
@@ -291,7 +296,7 @@ namespace HLE::VFS {
                 fake_files[fd] = content;
                 fake_file_pos[fd] = 0;
                 cpu->Regs()[0] = fd;
-                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                if constexpr (Config::Prints::vfs) std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
                 return;
             }
             if (strcmp(path, "/sys/devices/system/cpu/possible") == 0) {
@@ -301,7 +306,7 @@ namespace HLE::VFS {
                 fake_files[fd] = content;
                 fake_file_pos[fd] = 0;
                 cpu->Regs()[0] = fd;
-                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                if constexpr (Config::Prints::vfs) std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
                 return;
             }
             if (strcmp(path, "/proc/self/auxv") == 0) {
@@ -312,7 +317,7 @@ namespace HLE::VFS {
                 fake_files[fd] = content;
                 fake_file_pos[fd] = 0;
                 cpu->Regs()[0] = fd;
-                std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
+                if constexpr (Config::Prints::vfs) std::cout << "[VFS] open fake /proc/cpuinfo -> fd=" << fd << std::endl;
                 return;
             }
 
@@ -327,7 +332,7 @@ namespace HLE::VFS {
 
             uint32_t lr = cpu->Regs()[14];
 
-            {
+            if constexpr (Config::Prints::vfs) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[VFS] write caller LR=0x" << std::hex << lr << std::dec
                           << " fd=" << fd << " count=" << count << std::endl;

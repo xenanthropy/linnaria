@@ -7,6 +7,7 @@
 #include "ThreadingHelpers.hpp"
 #include "CPUHelper.hpp"
 #include "Watchpoint.hpp"
+#include "Config.hpp"
 
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <thread>
@@ -75,11 +76,11 @@ namespace HLE::Threading {
                 config.callbacks = &callbacks;
                 config.page_table = &memory.page_table;
                 config.absolute_offset_page_table = false;
-                /* DEBUG: disable fastmem_pointer on workers so MemoryWrite* callbacks
-                   actually fire and the cross-thread watchpoint can trip. Match the
-                   main thread's debug toggle in main.cpp:212. */
-                //config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
-                config.fastmem_pointer = 0;
+                // Fastmem on workers: matched to the main thread via Config.
+                // Off keeps cross-thread Watchpoint checks live; on is the
+                // perf default.
+                config.fastmem_pointer = Config::Performance::fastmem
+                    ? reinterpret_cast<uintptr_t>(memory.fastmem_base) : 0;
                 config.recompile_on_fastmem_failure = true;
                 config.arch_version = Dynarmic::A32::ArchVersion::v7;
 

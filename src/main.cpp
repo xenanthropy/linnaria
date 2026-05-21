@@ -14,6 +14,7 @@
 #include "CPUHelper.hpp"
 #include "Watchpoint.hpp"
 #include "Pacing.hpp"
+#include "Config.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -217,10 +218,12 @@ int main(int argc, char** argv) {
         config.page_table = &memory.page_table;
         config.absolute_offset_page_table = false;
 
-        /* DEBUG: disable fastmem_pointer to check memory issues - leave on otherwise */
-        //config.fastmem_pointer = reinterpret_cast<uintptr_t>(memory.fastmem_base);
-        config.fastmem_pointer = 0;
-
+        // Fastmem and Dynarmic verbose-trace controlled from Config.hpp.
+        // Off -> all memory accesses route through EmuCallbacks (OOB trap +
+        // Watchpoint check fire). On -> Dynarmic emits direct pointer
+        // arithmetic against the page table for a major perf win.
+        config.fastmem_pointer = Config::Performance::fastmem
+            ? reinterpret_cast<uintptr_t>(memory.fastmem_base) : 0;
         config.recompile_on_fastmem_failure = true;
         config.arch_version = Dynarmic::A32::ArchVersion::v7;
 
@@ -230,10 +233,8 @@ int main(int argc, char** argv) {
         uint32_t main_tls = memory.AllocateHeap(4096);
         config.coprocessors[15] = std::make_shared<AndroidCP15>(main_tls);
 
-        // DEBUG: enable BIG BOI debugging for bad issues
-        // Keep disabled otherwise, way too much logging
-        //config.very_verbose_debugging_output = true;
-        
+        config.very_verbose_debugging_output = Config::Performance::verboseDynarmic;
+
         Dynarmic::A32::Jit cpu(config);
         callbacks.cpu = &cpu;
         // assign active cpu to CPUhelper
