@@ -46,8 +46,14 @@ public:
                 OPTIONAL: Uncomment to see successful calls
             */
             if constexpr (Config::Prints::functionCalls) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] Executing: " << name << "\n";
+                bool muted = false;
+                for (auto m : Config::Prints::functionCallMutes) {
+                    if (name.find(m) != std::string::npos) { muted = true; break; }
+                }
+                if (!muted) {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Thread " << active_thread_id << "] Executing: " << name << "\n";
+                }
             }
             it->second.handler(cpu);
         } else {

@@ -220,9 +220,15 @@ namespace HLE::Android {
                     output += fmt[i];
                 }
             }
-            {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Android Log] " << tag << ": " << output << std::endl;
+            if constexpr (Config::Prints::androidLog) {
+                bool muted = false;
+                for (auto m : Config::Prints::androidLogMutes) {
+                    if (output.find(m) != std::string::npos) { muted = true; break; }
+                }
+                if (!muted) {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Android Log] " << tag << ": " << output << std::endl;
+                }
             }
 
             // Boot-state trigger: once the Octarine engine reports the

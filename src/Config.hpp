@@ -1,12 +1,13 @@
 #pragma once
 
+#include <string_view>
+
 // Compile-time configuration toggles. Defaults match "production" mode:
 // fastmem on, most diagnostic prints off. Edit the values below and
 // rebuild to change them. Because these are constexpr the compiler
 // fully eliminates disabled print sites -- zero runtime cost when off.
 //
 // Always-on regardless of these flags:
-//   - The Android log stream ([Android Log] ... lines).
 //   - Error-class diagnostics ([ZLIB] ERROR, [Watchpoint] CROSS-THREAD,
 //     OOB traps, [UNIMPLEMENTED] syscall calls).
 
@@ -30,6 +31,20 @@ namespace Config {
         // Spammy enough to noticeably slow the terminal at 60 Hz.
         inline constexpr bool functionCalls = false;
 
+        // Substring matched against the syscall name when functionCalls is
+        // on. Names containing any of these are NOT printed -- useful for
+        // muting high-frequency calls while tracing a specific behavior.
+        // Add or remove freely.
+        inline constexpr std::string_view functionCallMutes[] = {
+            "pthread_mutex_lock",
+            "pthread_mutex_unlock",
+            "pthread_self",
+            "JNI_PushLocalFrame",
+            "JNI_PopLocalFrame",
+            "JNI_GetMethodID",
+            "JNI_FindClass",
+        };
+
         // HLE_Zlib "[zlib] inflate(flush=...)" per-decompress trace.
         // [ZLIB] ERROR lines remain on regardless.
         inline constexpr bool zlib = false;
@@ -41,6 +56,19 @@ namespace Config {
         // HLE_Android "[AssetManager] Opening: / FAILED / Allocated /
         // Magic Bytes" lines for each asset access.
         inline constexpr bool assetManager = false;
+
+        // HLE_Android "[Android Log] <tag>: <body>" stream from the game's
+        // __android_log_print calls. Default on -- this is where Octarine's
+        // own diagnostics surface.
+        inline constexpr bool androidLog = true;
+
+        // Substring matched against the formatted Android log body when
+        // androidLog is on. Lines containing any of these are NOT printed.
+        // Defaults mute the per-touch chatter that floods during dragging.
+        inline constexpr std::string_view androidLogMutes[] = {
+            "RespondToTouchTrack",
+            "TapCount:",
+        };
     }
 
 }
