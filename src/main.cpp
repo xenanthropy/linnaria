@@ -15,6 +15,7 @@
 #include "Watchpoint.hpp"
 #include "Pacing.hpp"
 #include "Config.hpp"
+#include "Input.hpp"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -26,17 +27,20 @@
 thread_local Dynarmic::A32::Jit* active_cpu = nullptr;
 thread_local uint32_t active_thread_id = 0;
 
-void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader& loader, 
-                         const std::string& func_name, const std::vector<uint32_t>& args) {
-    
+void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader& loader,
+                         const std::string& func_name, const std::vector<uint32_t>& args,
+                         bool verbose) {
+
     uint32_t func_addr = loader.GetExport(func_name);
     if (func_addr == 0) {
         std::cerr << "[Boot] Could not find function: " << func_name << std::endl;
         return;
     }
 
-    std::cout << "\n=============================================" << std::endl;
-    std::cout << "[Boot] Executing " << func_name << "..." << std::endl;
+    if (verbose) {
+        std::cout << "\n=============================================" << std::endl;
+        std::cout << "[Boot] Executing " << func_name << "..." << std::endl;
+    }
 
     // 1. Reset the Stack Pointer
     uint32_t sp = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
@@ -372,20 +376,35 @@ int main(int argc, char** argv) {
         uint32_t last_tick = SDL_GetTicks();
         uint32_t last_swap = SDL_GetTicks();
 
+        // True when main_thread is between native calls (last halt was
+        // UserDefined1). Used to gate Input::DrainPending so we don't
+        // re-use the stack while a guest function is paused on it.
+        bool main_thread_clean = true;
+
         while (running) {
             // --- 1. Host events ---
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_QUIT) running = false;
-                else if (event.type == SDL_KEYDOWN) {
+                if (event.type == SDL_QUIT) { running = false; continue; }
+                if (event.type == SDL_KEYDOWN) {
+                    bool consumed = true;
                     switch (event.key.keysym.sym) {
                         case SDLK_F1: Pacing::game_tick_hz.store(0);  break;
                         case SDLK_F2: Pacing::game_tick_hz.store(60); break;
                         case SDLK_F3: Pacing::display_hz.store(0);    break;
                         case SDLK_F4: Pacing::display_hz.store(60);   break;
-                        default: break;
+                        default: consumed = false; break;
                     }
+                    if (consumed) continue;
                 }
+                Input::HandleSDLEvent(event);
+            }
+
+            // --- 1b. Drain queued input events into the guest. Only when
+            //         the main thread is at a clean return point so we
+            //         don't trample a paused frame on the shared stack. ---
+            if (main_thread_clean) {
+                Input::DrainPending(cpu, memory, loader, env_ptr);
             }
 
             uint32_t game_tick_hz = Pacing::game_tick_hz.load();
@@ -422,10 +441,16 @@ int main(int argc, char** argv) {
                     // The return thunk is ARM code, so the saved CPSR is ARM mode.
                     // We must force Thumb mode again because nativeOnUpdate is a Thumb function.
                     main_thread.cpsr = 0x00000030;
+
+                    // Stack is empty below the reset SP -- safe for the next
+                    // iteration's Input::DrainPending to re-use it.
+                    main_thread_clean = true;
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined2) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
                     // Loop's idle-yield below handles the sleep; nothing to do here.
+                    // Stack holds the paused frame -- input dispatch must wait.
+                    main_thread_clean = false;
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined3) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
@@ -440,6 +465,7 @@ int main(int argc, char** argv) {
                             main_thread.regs[r] = cpu.Regs()[r];
                         main_thread.cpsr = cpu.Cpsr();
                     }
+                    main_thread_clean = false;
                 }
 
                 last_tick = now;
