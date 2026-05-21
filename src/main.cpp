@@ -444,14 +444,20 @@ int main(int argc, char** argv) {
                 last_tick = now;
             }
 
-            // --- 3. Present (if swap budget is due) ---
-            if (swap_due) {
+            // --- 3. Present (if swap budget is due AND back buffer has new
+            //         content). Skipping the swap when frame_dirty is false
+            //         avoids the ping-pong flicker that happens when a logic-
+            //         only nativeOnUpdate didn't redraw the back buffer.
+            bool swapped = false;
+            if (swap_due && Pacing::frame_dirty.load(std::memory_order_relaxed)) {
                 SDL_GL_SwapWindow(window);
+                Pacing::frame_dirty.store(false, std::memory_order_relaxed);
                 last_swap = now;
+                swapped = true;
             }
 
             // --- 4. Idle yield: don't pin a core when nothing's due ---
-            if (!tick_due && !swap_due) {
+            if (!tick_due && !swapped) {
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
             }
         }

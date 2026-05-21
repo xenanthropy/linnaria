@@ -1,6 +1,7 @@
 #pragma once
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
+#include "Pacing.hpp"
 #include <glad/gles2.h>
 
 #include <zlib.h>
@@ -15,7 +16,10 @@ namespace HLE::OpenGL {
             // Do nothing
         };
 
-        ROUTE_REGISTER(router, "glClear", [](Dynarmic::A32::Jit* cpu) { glClear(cpu->Regs()[0]); });
+        ROUTE_REGISTER(router, "glClear", [](Dynarmic::A32::Jit* cpu) {
+            glClear(cpu->Regs()[0]);
+            Pacing::frame_dirty.store(true, std::memory_order_relaxed);
+        });
         ROUTE_REGISTER(router, "glEnable", [](Dynarmic::A32::Jit* cpu) { glEnable(cpu->Regs()[0]); });
         ROUTE_REGISTER(router, "glDisable", [](Dynarmic::A32::Jit* cpu) { glDisable(cpu->Regs()[0]); });
         ROUTE_REGISTER(router, "glDepthMask", [](Dynarmic::A32::Jit* cpu) { glDepthMask(cpu->Regs()[0]); });
@@ -185,6 +189,7 @@ namespace HLE::OpenGL {
             }
 
             glDrawElements(mode, count, type, host_indices);
+            Pacing::frame_dirty.store(true, std::memory_order_relaxed);
         });
 
         // The Geometry Shipper
