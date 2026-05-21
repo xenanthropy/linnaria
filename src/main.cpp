@@ -384,6 +384,40 @@ int main(int argc, char** argv) {
         // game that hasn't completed its first nativeOnUpdate yet.
         bool main_thread_clean = false;
 
+        // UserDefined1 fires every time the main guest thread completes a
+        // nativeOnUpdate. Heartbeat prints every 60th one (~1 per second
+        // at 60 Hz). If this counter stops advancing, cpu.Run is not
+        // returning -- main is in a guest function that won't halt.
+        uint64_t ud1_counter = 0;
+        uint64_t last_ud1_report = 0;
+
+        // Background watchdog thread: samples the main guest PC every
+        // ~1s. If the same PC shows up for several consecutive samples,
+        // main is in a busy-wait loop at that address. Look it up in IDA
+        // to identify the function. Reading cpu.Regs()[15] from a
+        // different thread is technically a data race, but uint32_t
+        // loads are atomic on x86_64 and we only need a sample.
+        std::atomic<bool> watchdog_running{true};
+        std::thread watchdog;
+        if constexpr (Config::Prints::heartbeat) {
+            watchdog = std::thread([&cpu, &watchdog_running, &main_thread_clean]() {
+                uint32_t prev_pc = 0;
+                int unchanged = 0;
+                while (watchdog_running.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    if (!watchdog_running.load()) break;
+                    uint32_t pc = cpu.Regs()[15];
+                    if (pc == prev_pc) ++unchanged; else unchanged = 0;
+                    prev_pc = pc;
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Watchdog] main PC=0x" << std::hex << pc << std::dec
+                              << "  unchanged=" << unchanged
+                              << "  clean=" << (main_thread_clean ? "y" : "n")
+                              << "\n";
+                }
+            });
+        }
+
         while (running) {
             // --- 1. Host events ---
             SDL_Event event;
@@ -448,6 +482,15 @@ int main(int argc, char** argv) {
                     // Stack is empty below the reset SP -- safe for the next
                     // iteration's Input::DrainPending to re-use it.
                     main_thread_clean = true;
+
+                    if constexpr (Config::Prints::heartbeat) {
+                        ++ud1_counter;
+                        if (ud1_counter - last_ud1_report >= 60) {
+                            last_ud1_report = ud1_counter;
+                            std::lock_guard<std::mutex> lock(console_mutex);
+                            std::cout << "[Heartbeat] nativeOnUpdate completions=" << ud1_counter << "\n";
+                        }
+                    }
                 }
                 else if (halt == Dynarmic::HaltReason::UserDefined2) {
                     cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
@@ -493,6 +536,8 @@ int main(int argc, char** argv) {
         }
 
         // Clean up when the loop ends
+        watchdog_running.store(false);
+        if (watchdog.joinable()) watchdog.join();
         SDL_GL_DeleteContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();

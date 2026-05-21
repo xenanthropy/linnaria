@@ -77,6 +77,16 @@ namespace Config {
         // calling thread id. Use this to diagnose deadlocks: grep by
         // pointer to see the full lifecycle of a single mutex.
         inline constexpr bool mutexTrace = false;
+
+        // Watchdog heartbeat for the main thread. When on, a side host
+        // thread wakes every ~1s and prints the main guest CPU's PC plus
+        // a "stuck" counter (how many consecutive samples saw the same
+        // PC). If the counter climbs past a few, main is in a guest-side
+        // busy loop -- look up that PC in IDA to find which function.
+        // The main loop also prints a nativeOnUpdate completion counter,
+        // so if UserDefined1 stops firing entirely you know cpu.Run is
+        // not returning at all.
+        inline constexpr bool heartbeat = false;
     }
 
 }
