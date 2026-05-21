@@ -13,6 +13,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <memory>
 #include <unordered_map>
 
@@ -22,6 +24,11 @@ namespace HLE::Threading {
 
         static std::mutex host_mutex_lock;
         static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> host_mutexes;
+
+        // Condition variables live in a parallel map. condition_variable_any
+        // (not the regular one) so it pairs with the recursive_mutex above.
+        static std::mutex host_cv_lock;
+        static std::unordered_map<uint32_t, std::shared_ptr<std::condition_variable_any>> host_cvs;
 
         auto pthread_success = [](Dynarmic::A32::Jit* cpu) {
             cpu->Regs()[0] = 0; // 0 = Success
@@ -239,36 +246,85 @@ namespace HLE::Threading {
             cpu->Regs()[0] = 0;
         });
 
-        ROUTE_REGISTER(router, "pthread_cond_timedwait", [&memory](Dynarmic::A32::Jit* cpu) {
-            /* WARNING: experimental
-            // Blocking for now
+        // --- Condition variables ---
+        // All five are needed for the producer/consumer pattern Octarine
+        // uses for asset loading and the character-list scanner. Without
+        // proper signaling, timedwait used to return ETIMEDOUT immediately
+        // and the caller's "wait for worker" loop became a busy poll;
+        // worse, if the main thread held a mutex the worker needed, the
+        // missing signal turned the poll into a hang.
 
+        auto get_cv = [](uint32_t cv_ptr) -> std::shared_ptr<std::condition_variable_any> {
+            std::lock_guard<std::mutex> lock(host_cv_lock);
+            auto& slot = host_cvs[cv_ptr];
+            if (!slot) slot = std::make_shared<std::condition_variable_any>();
+            return slot;
+        };
+
+        auto get_mutex = [](uint32_t mutex_ptr) -> std::shared_ptr<std::recursive_mutex> {
+            std::lock_guard<std::mutex> lock(host_mutex_lock);
+            auto& slot = host_mutexes[mutex_ptr];
+            if (!slot) slot = std::make_shared<std::recursive_mutex>();
+            return slot;
+        };
+
+        ROUTE_REGISTER(router, "pthread_cond_destroy", [](Dynarmic::A32::Jit* cpu) {
+            uint32_t cv_ptr = cpu->Regs()[0];
+            std::lock_guard<std::mutex> lock(host_cv_lock);
+            host_cvs.erase(cv_ptr);
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_cond_signal", [get_cv](Dynarmic::A32::Jit* cpu) {
+            auto cv = get_cv(cpu->Regs()[0]);
+            cv->notify_one();
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_cond_broadcast", [get_cv](Dynarmic::A32::Jit* cpu) {
+            auto cv = get_cv(cpu->Regs()[0]);
+            cv->notify_all();
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_cond_wait", [get_cv, get_mutex](Dynarmic::A32::Jit* cpu) {
+            auto cv = get_cv(cpu->Regs()[0]);
+            auto m  = get_mutex(cpu->Regs()[1]);
+            // The guest already holds the mutex (pthread_mutex_lock was
+            // called before this). adopt_lock + release at the end keeps
+            // it held across the wait/wake cycle, which is the contract.
+            std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
+            cv->wait(lock);
+            lock.release();
+            cpu->Regs()[0] = 0;
+        });
+
+        ROUTE_REGISTER(router, "pthread_cond_timedwait", [&memory, get_cv, get_mutex](Dynarmic::A32::Jit* cpu) {
+            uint32_t cv_ptr     = cpu->Regs()[0];
+            uint32_t mutex_ptr  = cpu->Regs()[1];
             uint32_t abstime_ptr = cpu->Regs()[2];
 
-            int64_t sleep_us = 1000; // hard minimum: always yield at least 1 ms
+            auto cv = get_cv(cv_ptr);
+            auto m  = get_mutex(mutex_ptr);
 
+            // Bionic abstime is CLOCK_REALTIME-based (struct timespec).
+            // Convert to a system_clock time_point for wait_until.
+            std::chrono::time_point<std::chrono::system_clock> deadline;
             if (abstime_ptr) {
-                int32_t tv_sec  = static_cast<int32_t>(memory.Read32(abstime_ptr));
-                int32_t tv_nsec = static_cast<int32_t>(memory.Read32(abstime_ptr + 4));
-
-                // Use gettimeofday here too so we are guaranteed to match the guest
-                struct timeval now;
-                ::gettimeofday(&now, nullptr);
-                int64_t now_us    = static_cast<int64_t>(now.tv_sec) * 1000000LL + now.tv_usec;
-                int64_t abstime_us = static_cast<int64_t>(tv_sec) * 1000000LL + (tv_nsec / 1000LL);
-
-                int64_t diff = abstime_us - now_us;
-                if (diff > sleep_us) sleep_us = diff;
-                if (sleep_us > 50000) sleep_us = 50000; // cap at 50ms so we don't hang the emu
+                int64_t tv_sec  = static_cast<int32_t>(memory.Read32(abstime_ptr));
+                int64_t tv_nsec = static_cast<int32_t>(memory.Read32(abstime_ptr + 4));
+                deadline = std::chrono::system_clock::time_point{}
+                         + std::chrono::seconds(tv_sec)
+                         + std::chrono::nanoseconds(tv_nsec);
+            } else {
+                deadline = std::chrono::system_clock::now();
             }
 
-            if (sleep_us > 0) {
-                usleep(static_cast<useconds_t>(sleep_us));
-            }
-            */
+            std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
+            auto status = cv->wait_until(lock, deadline);
+            lock.release();
 
-            cpu->Regs()[0] = ETIMEDOUT; // 110
-            cpu->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+            cpu->Regs()[0] = (status == std::cv_status::timeout) ? 110 /* ETIMEDOUT */ : 0;
         });
 
     }
