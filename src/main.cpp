@@ -400,20 +400,38 @@ int main(int argc, char** argv) {
         std::atomic<bool> watchdog_running{true};
         std::thread watchdog;
         if constexpr (Config::Prints::heartbeat) {
-            watchdog = std::thread([&cpu, &watchdog_running, &main_thread_clean]() {
+            watchdog = std::thread([&cpu, &memory, &watchdog_running, &main_thread_clean]() {
                 uint32_t prev_pc = 0;
                 int unchanged = 0;
+                bool dumped = false;
                 while (watchdog_running.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     if (!watchdog_running.load()) break;
                     uint32_t pc = cpu.Regs()[15];
-                    if (pc == prev_pc) ++unchanged; else unchanged = 0;
+                    if (pc == prev_pc) ++unchanged; else { unchanged = 0; dumped = false; }
                     prev_pc = pc;
                     std::lock_guard<std::mutex> lock(console_mutex);
                     std::cout << "[Watchdog] main PC=0x" << std::hex << pc << std::dec
                               << "  unchanged=" << unchanged
                               << "  clean=" << (main_thread_clean ? "y" : "n")
                               << "\n";
+                    // When the PC is wedged, dump the register file + a slice
+                    // of the stack once. LR (R14) is the most recent return
+                    // address; the stacked words are the call chain. Look
+                    // them up in IDA to find who jumped into garbage.
+                    if (unchanged >= 3 && !dumped) {
+                        dumped = true;
+                        std::cout << "[Watchdog] STUCK -- register dump:\n";
+                        for (int r = 0; r < 16; r++)
+                            std::cout << "    R" << r << "=0x" << std::hex << cpu.Regs()[r] << std::dec << "\n";
+                        std::cout << "    CPSR=0x" << std::hex << cpu.Cpsr() << std::dec << "\n";
+                        uint32_t sp = cpu.Regs()[13];
+                        std::cout << "[Watchdog] stack from SP=0x" << std::hex << sp << ":\n";
+                        for (int i = 0; i < 24; i++) {
+                            uint32_t a = sp + i * 4;
+                            std::cout << "    [SP+0x" << std::hex << (i * 4) << "]=0x" << memory.Read32(a) << std::dec << "\n";
+                        }
+                    }
                 }
             });
         }
