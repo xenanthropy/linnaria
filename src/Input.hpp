@@ -1,6 +1,7 @@
 #pragma once
 #include <SDL2/SDL.h>
 #include <vector>
+#include <deque>
 #include <cstring>
 #include <cstdint>
 #include <string>
@@ -28,8 +29,12 @@ namespace Input {
 
     // Pending events accumulate here whenever SDL polls them and drain into
     // native calls at a safe point between guest ticks (see DrainPending).
-    inline std::vector<TouchEvt> touch_queue;
-    inline std::vector<KeyEvt>   key_queue;
+    // deque so DrainPending can pop one from the front per frame -- the
+    // game's native side (fjAddTouchEvent) appends to a fixed-size internal
+    // queue that nativeOnUpdate drains each frame, so we must NOT dispatch
+    // a burst or that buffer overflows and smashes a return address.
+    inline std::deque<TouchEvt> touch_queue;
+    inline std::deque<KeyEvt>   key_queue;
 
     // Tracks left-mouse-down across motion events so we only synthesize
     // touch MOVE while the "finger" is actually down (matching Android,
@@ -129,10 +134,23 @@ namespace Input {
                 break;
             case SDL_MOUSEMOTION:
                 if (mouse_held) {
-                    touch_queue.push_back({0, MOVE,
-                        static_cast<float>(ev.motion.x),
-                        static_cast<float>(ev.motion.y),
-                        time_field()});
+                    // Coalesce: if the newest queued event is already a MOVE
+                    // for this pointer, overwrite its position rather than
+                    // appending. A fast drag generates far more motion events
+                    // than the game can drain per frame; without this the
+                    // queue (and the game's internal one) would burst.
+                    if (!touch_queue.empty()
+                        && touch_queue.back().action == MOVE
+                        && touch_queue.back().id == 0) {
+                        touch_queue.back().x = static_cast<float>(ev.motion.x);
+                        touch_queue.back().y = static_cast<float>(ev.motion.y);
+                        touch_queue.back().time = time_field();
+                    } else {
+                        touch_queue.push_back({0, MOVE,
+                            static_cast<float>(ev.motion.x),
+                            static_cast<float>(ev.motion.y),
+                            time_field()});
+                    }
                 }
                 break;
             case SDL_KEYDOWN: {
@@ -159,17 +177,24 @@ namespace Input {
     // thread is at a clean return point (last halt was UserDefined1) so
     // that re-using the stack at CODE_BASE + MEMORY_SIZE - 0x100000 inside
     // ExecuteGameFunction doesn't trample a paused nativeOnUpdate frame.
+    //
+    // Dispatches AT MOST ONE touch and one key per call. DrainPending runs
+    // once per main-loop iteration, and the main loop ticks nativeOnUpdate
+    // right after -- so one-per-iteration guarantees the game drains its
+    // internal touch queue between each fjAddTouchEvent. Dispatching the
+    // whole backlog at once (the old behavior) overflowed that fixed-size
+    // queue, corrupting a saved return address -> wild jump -> freeze.
     inline void DrainPending(Dynarmic::A32::Jit& cpu, GuestMemory& memory,
                              ElfLoader& loader, uint32_t env_ptr) {
-        if (touch_queue.empty() && key_queue.empty()) return;
-
         auto float_bits = [](float f) -> uint32_t {
             uint32_t u;
             std::memcpy(&u, &f, 4);
             return u;
         };
 
-        for (const auto& t : touch_queue) {
+        if (!touch_queue.empty()) {
+            const TouchEvt t = touch_queue.front();
+            touch_queue.pop_front();
             ExecuteGameFunction(cpu, memory, loader,
                 "Java_com_codeglue_terraria_OctarineBridge_nativeTouchEvent",
                 { env_ptr, 0,
@@ -180,9 +205,10 @@ namespace Input {
                   float_bits(t.time) },
                 /*verbose=*/false);
         }
-        touch_queue.clear();
 
-        for (const auto& k : key_queue) {
+        if (!key_queue.empty()) {
+            const KeyEvt k = key_queue.front();
+            key_queue.pop_front();
             ExecuteGameFunction(cpu, memory, loader,
                 "Java_com_codeglue_terraria_OctarineBridge_nativeKeyEvent",
                 { env_ptr, 0,
@@ -191,6 +217,5 @@ namespace Input {
                   static_cast<uint32_t>(k.keyCode) },
                 /*verbose=*/false);
         }
-        key_queue.clear();
     }
 }
