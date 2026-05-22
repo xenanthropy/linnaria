@@ -1,5 +1,6 @@
 #include <ios>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <exception>
 
@@ -16,6 +17,7 @@
 #include "Pacing.hpp"
 #include "Config.hpp"
 #include "Input.hpp"
+#include "dynarmic/interface/halt_reason.h"
 
 #include <dynarmic/interface/optimization_flags.h>
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -37,7 +39,8 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
         return;
     }
 
-    if (verbose) {
+    if (Config::Prints::miscPrints) {
+        std::lock_guard<std::mutex> lock(console_mutex);
         std::cout << "\n=============================================" << std::endl;
         std::cout << "[Boot] Executing " << func_name << "..." << std::endl;
     }
@@ -106,8 +109,11 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
                          uint32_t func_addr, const std::vector<uint32_t>& args) {
     if (func_addr == 0) return;
 
-    std::cout << "\n=============================================" << std::endl;
-    std::cout << "[Boot] Executing Thread at 0x" << std::hex << func_addr << std::dec << "..." << std::endl;
+    if (Config::Prints::miscPrints) {
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "\n=============================================" << std::endl;
+        std::cout << "[Boot] Executing Thread at 0x" << std::hex << func_addr << std::dec << "..." << std::endl;
+    }
 
     uint32_t sp = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
     
@@ -137,7 +143,12 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
     while (true) {
         auto halt_reason = cpu.Run();
         if (halt_reason == Dynarmic::HaltReason::UserDefined1) {
-            std::cout << "[Boot] Thread returned successfully!" << std::endl;
+            if (Config::Prints::miscPrints) {
+                {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Boot] Thread returned successfully!" << std::endl;
+                }
+            }
             cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
             break;
         }
@@ -254,8 +265,13 @@ int main(int argc, char** argv) {
 
         // Run C++ global constructors (init_array) before anything else
         for (uint32_t ctor : loader.GetConstructors()) {
-            std::cout << "[Boot] Running static constructor at 0x" 
-                      << std::hex << ctor << std::dec << std::endl;
+            if (Config::Prints::miscPrints) {
+                {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Boot] Running static constructor at 0x" 
+                              << std::hex << ctor << std::dec << std::endl;
+                }
+            }
             ExecuteGameFunction(cpu, memory, loader, ctor, {});
         }
 
@@ -268,7 +284,10 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        std::cout << "[Boot] Found nativeOnCreateActivity at 0x" << std::hex << on_create << std::dec << std::endl;
+        if (Config::Prints::miscPrints) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "[Boot] Found nativeOnCreateActivity at 0x" << std::hex << on_create << std::dec << std::endl;
+        }
 
         // Setup initial execution state
         cpu.SetCpsr(0x00000030); // Thumb mode, User mode
@@ -345,8 +364,11 @@ int main(int argc, char** argv) {
             ExecuteGameFunction(cpu, memory, loader, "Java_com_codeglue_terraria_OctarineBridge_nativeOnResume", { env_ptr, 0 });
         }
 
-        std::cout << "\n=============================================" << std::endl;
-        std::cout << "[Boot] Starting Main Game Loop!" << std::endl;
+        if (Config::Prints::miscPrints) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "\n=============================================" << std::endl;
+            std::cout << "[Boot] Starting Main Game Loop!" << std::endl;
+        }
 
         bool running = true;
         uint32_t frame_count = 0;
@@ -468,68 +490,74 @@ int main(int argc, char** argv) {
             bool tick_due = (game_tick_hz == 0) || (now - last_tick >= 1000u / game_tick_hz);
             bool swap_due = (display_hz   == 0) || (now - last_swap >= 1000u / display_hz);
 
-            // --- 2. Run Main Thread Slice (if tick budget is due) ---
             if (tick_due && main_thread.is_alive) {
-                // Restore
+                // Lock out input dispatch while the thread is working or suspended
+                main_thread_clean = false;
+
+                // Restore context to the JIT
                 for (int r = 0; r < 16; r++) cpu.Regs()[r] = main_thread.regs[r];
                 cpu.SetCpsr(main_thread.cpsr);
 
-                auto halt = cpu.Run();
+                // Keep driving the JIT until the guest explicitly yields or finishes the frame
+                while (true) {
+                    auto halt = cpu.Run();
 
-                // Save
-                for (int r = 0; r < 16; r++) main_thread.regs[r] = cpu.Regs()[r];
-                main_thread.cpsr = cpu.Cpsr();
+                    if (halt == Dynarmic::HaltReason::UserDefined1) {
+                        cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
 
-                if (halt == Dynarmic::HaltReason::UserDefined1) {
-                    cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
-                    // Function returned, this means one guest frame finished.
-                    // For the next host frame, re-enter nativeOnUpdate.
-                    main_thread.regs[15] = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnUpdate") & ~1;
-                    main_thread.regs[0]  = env_ptr;
-                    main_thread.regs[1]  = 0;
-                    main_thread.regs[2]  = 1;
-                    main_thread.regs[3]  = 1;
-                    // Re-arm the return trap (just in case)
-                    main_thread.regs[14] = loader.GetThunk("Emulator_Return_Trap");
-                    main_thread.regs[13] = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
+                        // Function returned; one guest frame finished.
+                        // Re-arm the context for the next host frame.
+                        main_thread.regs[15] = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnUpdate") & ~1;
+                        main_thread.regs[0]  = env_ptr;
+                        main_thread.regs[1]  = 0;
+                        main_thread.regs[2]  = 1;
+                        main_thread.regs[3]  = 1;
+                        main_thread.regs[14] = loader.GetThunk("Emulator_Return_Trap");
+                        main_thread.regs[13] = GuestMemory::CODE_BASE + GuestMemory::MEMORY_SIZE - 0x100000;
+                        main_thread.cpsr = 0x00000030; // Force Thumb mode
 
-                    // The return thunk is ARM code, so the saved CPSR is ARM mode.
-                    // We must force Thumb mode again because nativeOnUpdate is a Thumb function.
-                    main_thread.cpsr = 0x00000030;
+                        // Frame is clean, input can be dispatched next loop
+                        main_thread_clean = true;
 
-                    // Stack is empty below the reset SP -- safe for the next
-                    // iteration's Input::DrainPending to re-use it.
-                    main_thread_clean = true;
-
-                    if constexpr (Config::Prints::heartbeat) {
-                        ++ud1_counter;
-                        if (ud1_counter - last_ud1_report >= 60) {
-                            last_ud1_report = ud1_counter;
-                            std::lock_guard<std::mutex> lock(console_mutex);
-                            std::cout << "[Heartbeat] nativeOnUpdate completions=" << ud1_counter << "\n";
+                        if constexpr (Config::Prints::heartbeat) {
+                            ++ud1_counter;
+                            if (ud1_counter - last_ud1_report >= 60) {
+                                last_ud1_report = ud1_counter;
+                                std::lock_guard<std::mutex> lock(console_mutex);
+                                std::cout << "[Heartbeat] nativeOnUpdate completions=" << ud1_counter << "\n";
+                            }
                         }
+                        break; // Exit inner loop
                     }
-                }
-                else if (halt == Dynarmic::HaltReason::UserDefined2) {
-                    cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
-                    // Loop's idle-yield below handles the sleep; nothing to do here.
-                    // Stack holds the paused frame -- input dispatch must wait.
-                    main_thread_clean = false;
-                }
-                else if (halt == Dynarmic::HaltReason::UserDefined3) {
-                    cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
-                    // Restore the saved state from pthread_once redirection
-                    if (once_saved_state.valid) {
-                        for (int r = 0; r < 16; r++)
-                            cpu.Regs()[r] = once_saved_state.regs[r];
-                        cpu.SetCpsr(once_saved_state.cpsr);
-                        once_saved_state.valid = false;
-                        // The CPU now continues from the instruction right after the SVC that triggered pthread_once.
-                        for (int r = 0; r < 16; r++)
-                            main_thread.regs[r] = cpu.Regs()[r];
+                    else if (halt == Dynarmic::HaltReason::UserDefined2) {
+                        cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
+
+                        // The game called a yielding function (e.g., usleep).
+                        // Save the exact paused state to resume next frame.
+                        for (int r = 0; r < 16; r++) main_thread.regs[r] = cpu.Regs()[r];
                         main_thread.cpsr = cpu.Cpsr();
+
+                        main_thread_clean = false; // Still active/suspended
+                        break; // Exit inner loop to let SDL poll and host sleep
                     }
-                    main_thread_clean = false;
+                    else if (halt == Dynarmic::HaltReason::UserDefined3) {
+                        cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
+
+                        // Restore the saved state from pthread_once redirection
+                        if (once_saved_state.valid) {
+                            for (int r = 0; r < 16; r++) cpu.Regs()[r] = once_saved_state.regs[r];
+                            cpu.SetCpsr(once_saved_state.cpsr);
+                            once_saved_state.valid = false;
+                        }
+                        // Do not break; immediately loop back and call cpu.Run() again
+                    }
+                    else {
+                        // Tick budget exhaustion (halt == 0) or another internal halt
+                        if (static_cast<uint64_t>(halt) != 0) {
+                            cpu.ClearHalt(halt);
+                        }
+                        // Do not break; immediately loop back and call cpu.Run() again
+                    }
                 }
 
                 last_tick = now;

@@ -104,6 +104,11 @@ namespace Config {
         // i.e. someone smashing a saved return address. Prints the writing
         // thread, the writer's PC, the target address, and the value.
         inline constexpr bool stackWriteTrap = false;
+
+        // This includes various miscellaneous prints such as the
+        // ======== bars separating thread runs, c++ constructor setup prints,
+        // and the ExecuteGameFunction function name prints
+        inline constexpr bool miscPrints = false;
     }
 
 }
