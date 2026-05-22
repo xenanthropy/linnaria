@@ -43,11 +43,15 @@ public:
     void MemoryWrite32(uint32_t vaddr, uint32_t value)  override {
         CheckCrossThreadWrite(vaddr, 4, value);
         if constexpr (Config::Prints::stackWriteTrap) {
-            // Catch someone smashing a saved return address near the top of
-            // the main stack with a page-aligned, code-pointer-shaped value.
-            bool top_of_stack = (vaddr >= 0x7FEFF000 && vaddr < 0x7FF00000);
-            bool garbage_ptr  = ((value & 0xFFF) == 0) && value >= 0x43000000 && value < 0x48000000;
-            if (top_of_stack && garbage_ptr) {
+            // Catch a stray write into the top of the main stack -- where
+            // nativeTouchEvent's saved registers live. The corrupting value
+            // turned out to be a touch coordinate as a float (e.g. 268.0f =
+            // 0x43860000), so trap on values in the float-coordinate range
+            // [32.0, 8192.0] -> [0x42000000, 0x46000000); that excludes code
+            // addresses (< ~0x41000000) and heap pointers (>= 0x50000000).
+            bool top_of_stack = (vaddr >= 0x7FEFFF00 && vaddr < 0x7FF00000);
+            bool coord_like   = (value >= 0x42000000 && value < 0x46000000);
+            if (top_of_stack && coord_like) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[StackTrap] thread " << active_thread_id
                           << " wrote 0x" << std::hex << value
