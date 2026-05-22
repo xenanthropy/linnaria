@@ -5,6 +5,8 @@
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
 #include "SyscallRouter.hpp"
+#include "Config.hpp"
+#include "CPUHelper.hpp"
 #include <mutex>
 
 #include "Watchpoint.hpp"
@@ -40,6 +42,21 @@ public:
     }
     void MemoryWrite32(uint32_t vaddr, uint32_t value)  override {
         CheckCrossThreadWrite(vaddr, 4, value);
+        if constexpr (Config::Prints::stackWriteTrap) {
+            // Catch someone smashing a saved return address near the top of
+            // the main stack with a page-aligned, code-pointer-shaped value.
+            bool top_of_stack = (vaddr >= 0x7FEFF000 && vaddr < 0x7FF00000);
+            bool garbage_ptr  = ((value & 0xFFF) == 0) && value >= 0x43000000 && value < 0x48000000;
+            if (top_of_stack && garbage_ptr) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[StackTrap] thread " << active_thread_id
+                          << " wrote 0x" << std::hex << value
+                          << " -> 0x" << vaddr
+                          << "  (writer PC=0x" << (cpu ? cpu->Regs()[15] : 0)
+                          << " LR=0x" << (cpu ? cpu->Regs()[14] : 0) << ")"
+                          << std::dec << "\n";
+            }
+        }
         mem.Write32(vaddr, value);
     }
 

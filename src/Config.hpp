@@ -87,6 +87,14 @@ namespace Config {
         // so if UserDefined1 stops firing entirely you know cpu.Run is
         // not returning at all.
         inline constexpr bool heartbeat = false;
+
+        // Stack-corruption trap (requires fastmem OFF so writes route
+        // through EmuCallbacks). Logs every guest write that stores a
+        // page-aligned, code-pointer-shaped value (0x43000000-0x48000000)
+        // into the top page of the main stack (0x7FEFF000-0x7FF00000) --
+        // i.e. someone smashing a saved return address. Prints the writing
+        // thread, the writer's PC, the target address, and the value.
+        inline constexpr bool stackWriteTrap = false;
     }
 
 }
