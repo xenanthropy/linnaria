@@ -199,6 +199,8 @@ public:
 
         uint32_t addr;
         uint32_t alloc_size;
+        uint32_t ovl_prev_base = 0, ovl_prev_end = 0, ovl_prev_pc = 0;
+        uint32_t ovl_next_base = 0, ovl_next_pc = 0;
         {
             std::lock_guard<std::mutex> lock(allocator_mutex);
 
@@ -233,6 +235,40 @@ public:
                 alloc_size = size;
                 allocations[addr] = {alloc_size, caller_pc, std::this_thread::get_id()};
             }
+
+            // Capture immediate neighbors (allocations is sorted) so we can
+            // run an overlap self-check *outside* this lock -- DumpAllocations
+            // Near re-locks allocator_mutex, so we must not call it here.
+            auto self = allocations.find(addr);
+            if (self != allocations.begin()) {
+                auto prev = std::prev(self);
+                ovl_prev_base = prev->first;
+                ovl_prev_end  = prev->first + prev->second.size;
+                ovl_prev_pc   = prev->second.caller_pc;
+            }
+            auto nxt = std::next(self);
+            if (nxt != allocations.end()) {
+                ovl_next_base = nxt->first;
+                ovl_next_pc   = nxt->second.caller_pc;
+            }
+        }
+
+        // Overlap self-check (out of lock). A free-list bug that hands out a
+        // block aliasing a still-live allocation is exactly how the touch
+        // deque's internal nodes get smashed -> garbage write pointer.
+        if ((ovl_prev_end != 0 && ovl_prev_end > addr) ||
+            (ovl_next_base != 0 && addr + alloc_size > ovl_next_base)) {
+            std::lock_guard<std::mutex> clock(console_mutex);
+            std::cout << "\n[AllocateHeap OVERLAP] new [0x" << std::hex << addr
+                      << ", 0x" << (addr + alloc_size) << ") caller_pc=0x" << caller_pc;
+            if (ovl_prev_end > addr)
+                std::cout << "  <-- overlaps prev [0x" << ovl_prev_base << ", 0x" << ovl_prev_end
+                          << ") prev_pc=0x" << ovl_prev_pc;
+            if (ovl_next_base != 0 && addr + alloc_size > ovl_next_base)
+                std::cout << "  <-- overlaps next @0x" << ovl_next_base << " next_pc=0x" << ovl_next_pc;
+            std::cout << std::dec << "\n";
+            DumpAllocationsNear(addr);
+            std::exit(1);
         }
 
         // Diagnostic: if the returned block overlaps any registered stack range,
