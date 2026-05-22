@@ -33,7 +33,7 @@ public:
         HLE::Strings::RegisterAll(router, memory);
         HLE::VFS::RegisterAll(router, memory);
         HLE::Math::RegisterAll(router, memory);
-        HLE::Stdlib::RegisterAll(router, memory);
+        HLE::Stdlib::RegisterAll(router, memory, loader);
         HLE::Time::RegisterAll(router, memory);
         HLE::Threading::RegisterAll(router, memory, loader, monitor);
         HLE::Network::RegisterAll(router, memory);

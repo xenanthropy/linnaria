@@ -1,10 +1,12 @@
 #pragma once
+#include "ElfLoader.hpp"
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
+#include "EmuCallbacks.hpp"
 
 namespace HLE::Stdlib {
 
-    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
+    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader) {
 
         ROUTE_REGISTER(router, "srand48", [](Dynarmic::A32::Jit* cpu) {
             long int seed = static_cast<long int>(cpu->Regs()[0]);
@@ -91,23 +93,80 @@ namespace HLE::Stdlib {
             cpu->Regs()[0] = static_cast<int>(out.size());
         });
 
-        ROUTE_REGISTER(router, "qsort", [&memory](Dynarmic::A32::Jit* cpu) {
-            uint32_t base_ptr = cpu->Regs()[0];
-            uint32_t nmemb    = cpu->Regs()[1];
-            uint32_t size     = cpu->Regs()[2];
-            // uint32_t compar   = cpu->Regs()[3]; // ignore for now
+        ROUTE_REGISTER(router, "qsort", [&memory, &loader, &router](Dynarmic::A32::Jit* cpu) {
+            uint32_t base   = cpu->Regs()[0];
+            uint32_t nmemb  = cpu->Regs()[1];
+            uint32_t size   = cpu->Regs()[2];
+            uint32_t compar = cpu->Regs()[3];
 
-            if (nmemb <= 1 || base_ptr == 0) return;
-
-            // Simple bubble sort using direct byte comparison? That would ignore the comparator.
-            // We need to respect the comparator for correctness. Since we can't call it easily,
-            // we'll implement a trampoline-based call later. For now, we print a warning and no-op.
-            static bool warned = false;
-            if (!warned) {
-                std::cout << "[WARNING] qsort called but not fully implemented (using no-op)." << std::endl;
-                warned = true;
+            if (nmemb <= 1 || size == 0) {
+                cpu->Regs()[0] = 0;
+                return;
             }
-            // No sorting, but this might not crash the game if the order isn't critical for boot.
+
+            // Spin up a temporary lightweight CPU instance specifically for the comparator
+            // to avoid violating Dynarmic's non-reentrant Run() rule.
+            Dynarmic::A32::UserConfig config;
+            EmuCallbacks temp_callbacks(memory, loader, router);
+            config.callbacks = &temp_callbacks;
+            config.page_table = &memory.page_table;
+            config.absolute_offset_page_table = false;
+            config.fastmem_pointer = Config::Performance::fastmem
+                ? reinterpret_cast<uintptr_t>(memory.fastmem_base) : 0;
+            config.recompile_on_fastmem_failure = true;
+            config.arch_version = Dynarmic::A32::ArchVersion::v7;
+            config.processor_id = 999; // Unique ID so it doesn't collide with hardware cores
+
+            Dynarmic::A32::Jit temp_cpu(config);
+            temp_callbacks.cpu = &temp_cpu;
+
+            // Allocate a safe scratch stack for the temporary CPU
+            uint32_t temp_sp = memory.AllocateHeap(1024 * 64);
+
+            // Create an array of indices to sort so we don't have to swap guest memory during the algorithm
+            std::vector<uint32_t> indices(nmemb);
+            for (uint32_t i = 0; i < nmemb; i++) indices[i] = i;
+
+            auto compare_elements = [&](uint32_t idx_a, uint32_t idx_b) -> bool {
+                temp_cpu.Regs()[13] = temp_sp + (1024 * 64);
+                temp_cpu.Regs()[0]  = base + idx_a * size;
+                temp_cpu.Regs()[1]  = base + idx_b * size;
+                temp_cpu.Regs()[14] = loader.GetThunk("Emulator_Return_Trap");
+
+                uint32_t cpsr = 0x10; // User mode
+                if (compar & 1) cpsr |= 0x20; // Thumb mode
+                temp_cpu.SetCpsr(cpsr);
+                temp_cpu.Regs()[15] = compar & ~1;
+
+                while (true) {
+                    auto halt = temp_cpu.Run();
+                    if (halt == Dynarmic::HaltReason::UserDefined1) break;
+                    if (static_cast<uint64_t>(halt) != 0) temp_cpu.ClearHalt(halt);
+                }
+
+                // qsort expects < 0 for a < b
+                int result = static_cast<int>(temp_cpu.Regs()[0]);
+                return result < 0;
+            };
+
+            std::sort(indices.begin(), indices.end(), compare_elements);
+
+            // Read out the memory in the newly sorted order
+            std::vector<uint8_t> sorted_data(nmemb * size);
+            for (uint32_t i = 0; i < nmemb; i++) {
+                uint32_t src = base + indices[i] * size;
+                for (uint32_t j = 0; j < size; j++) {
+                    sorted_data[i * size + j] = memory.Read8(src + j);
+                }
+            }
+
+            // Write it sequentially back into the guest
+            for (uint32_t i = 0; i < nmemb * size; i++) {
+                memory.Write8(base + i, sorted_data[i]);
+            }
+
+            memory.FreeHeap(temp_sp);
+            cpu->Regs()[0] = 0;
         });
 
         ROUTE_REGISTER(router, "strtol", [&memory](Dynarmic::A32::Jit* cpu) {

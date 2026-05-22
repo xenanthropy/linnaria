@@ -108,5 +108,22 @@ namespace HLE::Math {
             std::memcpy(&cpu->Regs()[0], &result, 4);
         });
 
+        ROUTE_REGISTER(router, "pow", [](Dynarmic::A32::Jit* cpu) {
+            uint64_t x_bits = (static_cast<uint64_t>(cpu->Regs()[1]) << 32) | cpu->Regs()[0];
+            uint64_t y_bits = (static_cast<uint64_t>(cpu->Regs()[3]) << 32) | cpu->Regs()[2];
+
+            double x, y;
+            std::memcpy(&x, &x_bits, sizeof(double));
+            std::memcpy(&y, &y_bits, sizeof(double));
+
+            double res = std::pow(x, y);
+
+            uint64_t res_bits;
+            std::memcpy(&res_bits, &res, sizeof(double));
+
+            cpu->Regs()[0] = static_cast<uint32_t>(res_bits & 0xFFFFFFFF);
+            cpu->Regs()[1] = static_cast<uint32_t>(res_bits >> 32);
+        });
+
     }
 }
