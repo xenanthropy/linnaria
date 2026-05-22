@@ -1,6 +1,7 @@
 #pragma once
 #include <SyscallRouter.hpp>
 #include <CPUHelper.hpp>
+#include "Config.hpp"
 #include <cstdlib>
 #include <vector>
 #include <array>
@@ -298,6 +299,11 @@ public:
         if (it != allocations.end()) {
             uint32_t size = it->second.size;
             allocations.erase(it);
+
+            // Diagnostic UAF probe: skip returning the block to the free
+            // list. The address is retired permanently, so a stale pointer
+            // can never alias a future allocation.
+            if (Config::Performance::disableHeapReuse) return;
 
             free_blocks[ptr] = size;
 

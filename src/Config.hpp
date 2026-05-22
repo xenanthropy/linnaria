@@ -24,6 +24,15 @@ namespace Config {
         // Dynarmic's very_verbose_debugging_output: extremely chatty
         // JIT trace, primarily useful for diagnosing mis-compiles.
         inline constexpr bool verboseDynarmic = false;
+
+        // Diagnostic: when true, FreeHeap is a no-op -- freed blocks are
+        // never returned to the free-list, so AllocateHeap only ever bump-
+        // allocates fresh memory. This makes a use-after-free impossible to
+        // observe (the stale pointer's memory is never re-handed out), the
+        // same way Android's allocator masks UAFs by delaying reuse. If a
+        // corruption/crash disappears with this on, it's a UAF. Leaks
+        // memory, so only for short diagnostic sessions.
+        inline constexpr bool disableHeapReuse = false;
     }
 
     namespace Prints {
