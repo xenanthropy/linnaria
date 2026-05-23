@@ -68,42 +68,81 @@ namespace HLE::Strings {
         ROUTE_REGISTER(router, "vsprintf", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t str_ptr = cpu->Regs()[0];
             uint32_t fmt_ptr = cpu->Regs()[1];
-            uint32_t ap = cpu->Regs()[2]; // va_list pointer
+            uint32_t ap      = cpu->Regs()[2]; // va_list (guest pointer to packed args)
 
-            std::string format = reinterpret_cast<const char*>(memory.GetHostPointer(fmt_ptr));
-            char* out_str = reinterpret_cast<char*>(memory.GetHostPointer(str_ptr));
-
-            std::string result = "";
-            for (size_t i = 0; i < format.length(); i++) {
-                if (format[i] == '%' && i + 1 < format.length()) {
-                    i++;
-                    if (format[i] == 'd' || format[i] == 'i') {
-                        int val = memory.Read32(ap); ap += 4;
-                        result += std::to_string(val);
-                    } else if (format[i] == 's') {
-                        uint32_t ptr = memory.Read32(ap); ap += 4;
-                        if (ptr) result += reinterpret_cast<const char*>(memory.GetHostPointer(ptr));
-                        else result += "(null)";
-                    } else if (format[i] == 'f') {
-                        // Floats are promoted to 8-byte doubles in varargs, and must be 8-byte aligned
-                        if (ap % 8 != 0) ap += 4; 
-                        uint64_t val = memory.Read64(ap); ap += 8;
-                        double d; std::memcpy(&d, &val, sizeof(double));
-                        result += std::to_string(d);
-                    } else if (format[i] == 'x' || format[i] == 'X') {
-                        int val = memory.Read32(ap); ap += 4;
-                        char buf[16]; snprintf(buf, sizeof(buf), format[i] == 'x' ? "%x" : "%X", val);
-                        result += buf;
-                    } else {
-                        result += format[i]; // Unhandled tag, just print it raw
-                    }
-                } else {
-                    result += format[i];
-                }
+            std::string format;
+            {
+                uint32_t f = fmt_ptr;
+                while (char c = static_cast<char>(memory.Read8(f++))) format += c;
             }
 
+            // 32-bit arg from the va_list. AAPCS soft-float passes a va_list as a
+            // pointer to a contiguous arg area; each int/ptr/float-as-double slot
+            // is the same as on-stack varargs.
+            auto get_next_arg_32 = [&]() -> uint32_t {
+                uint32_t v = memory.Read32(ap);
+                ap += 4;
+                return v;
+            };
+
+            // 64-bit args (double / %lld) require 8-byte alignment in the va_list.
+            auto get_next_arg_64 = [&]() -> uint64_t {
+                if (ap % 8 != 0) ap += 4;
+                uint32_t low  = memory.Read32(ap); ap += 4;
+                uint32_t high = memory.Read32(ap); ap += 4;
+                return (static_cast<uint64_t>(high) << 32) | low;
+            };
+
+            std::string result;
+            for (size_t i = 0; i < format.length(); i++) {
+                if (format[i] == '%' && i + 1 < format.length() && format[i + 1] != '%') {
+                    size_t j = i + 1;
+                    // Skip past flags, width, precision, length modifiers
+                    while (j < format.length()
+                           && std::string("cdiouxXfFeEgGspn").find(format[j]) == std::string::npos) {
+                        j++;
+                    }
+                    if (j < format.length()) {
+                        char type = format[j];
+                        std::string specifier = format.substr(i, j - i + 1);
+                        char temp_buf[512];
+
+                        if (type == 'f' || type == 'F' || type == 'e' || type == 'E'
+                            || type == 'g' || type == 'G') {
+                            uint64_t val = get_next_arg_64();
+                            double d;
+                            std::memcpy(&d, &val, sizeof(double));
+                            snprintf(temp_buf, sizeof(temp_buf), specifier.c_str(), d);
+                        } else if (type == 's') {
+                            uint32_t s_ptr = get_next_arg_32();
+                            std::string s;
+                            if (s_ptr) {
+                                uint32_t c = s_ptr;
+                                while (char ch = static_cast<char>(memory.Read8(c++))) s += ch;
+                            } else {
+                                s = "(null)";
+                            }
+                            snprintf(temp_buf, sizeof(temp_buf), specifier.c_str(), s.c_str());
+                        } else {
+                            uint32_t val = get_next_arg_32();
+                            snprintf(temp_buf, sizeof(temp_buf), specifier.c_str(), val);
+                        }
+
+                        result += temp_buf;
+                        i = j;
+                        continue;
+                    }
+                } else if (format[i] == '%' && i + 1 < format.length() && format[i + 1] == '%') {
+                    result += '%';
+                    i++;
+                    continue;
+                }
+                result += format[i];
+            }
+
+            char* out_str = reinterpret_cast<char*>(memory.GetHostPointer(str_ptr));
             std::strcpy(out_str, result.c_str());
-            cpu->Regs()[0] = result.length();
+            cpu->Regs()[0] = static_cast<uint32_t>(result.length());
         });
 
         ROUTE_REGISTER(router, "atoi", [&memory](Dynarmic::A32::Jit* cpu) {
