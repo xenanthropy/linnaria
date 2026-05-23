@@ -17,7 +17,7 @@ build/linnaria lib/libTerraria.so                # user-supplied; APK assets mus
 
 Requires C++20 (Dynarmic), SDL2, zlib, and `glesv2` via pkg-config. `DYNARMIC_FRONTENDS` is pinned to `A32` in `CMakeLists.txt` — don't enable A64. There are no tests or linters wired up. If newer Xbyak is installed system-wide and Dynarmic miscompiles, apply `fix_xbyak.patch` (see BUILD.md).
 
-A debug ThreadSanitizer build is plumbed but commented out in `CMakeLists.txt`. `config.very_verbose_debugging_output` and `config.fastmem_pointer` toggles in `src/main.cpp` are the usual knobs for diagnosing memory/JIT issues.
+A debug ThreadSanitizer build is plumbed but commented out in `CMakeLists.txt`. All runtime knobs (fastmem, the Dynarmic verbose trace, every diagnostic print, mute lists, watchdog, stack-write trap, UAF probe, etc.) live in **`src/Config.hpp`** as `inline constexpr` toggles — edit the file, rebuild, that's it. The values are constexpr so disabled paths fully DCE away. Defaults are "production" (fastmem on, prints off, Android log on with touch chatter muted).
 
 ## Architecture
 
@@ -35,9 +35,10 @@ The `page_table` array is handed to Dynarmic's fastmem path; `GetHostPointer` is
 **`EmuCallbacks`** (`src/EmuCallbacks.hpp`) implements `Dynarmic::A32::UserCallbacks`. SVC `0xFFFFFF` is reserved as the **pthread_once-done trap** and triggers `HaltReason::UserDefined3`; all other SVCs are symbol thunks. `PrintOOBMemoryRead` hard-exits on reads below `0x40000000` or at the `0xFFFFFFF4` Bionic stack-guard slot — these almost always indicate a missing HLE or a corrupted vtable.
 
 **Halt-reason protocol** between guest code and `main.cpp`'s `ExecuteGameFunction` / main loop:
-- `UserDefined1` — guest function returned (LR was set to the `Emulator_Return_Trap` thunk). Normal exit.
-- `UserDefined2` — yield request from HLE (e.g. sleep/usleep). Main loop sleeps 1 ms and re-enters.
-- `UserDefined3` — `pthread_once` finished its callback; restore `once_saved_state` (declared `thread_local` in `ThreadingHelpers.cpp`) so the original caller resumes.
+- `UserDefined1` — guest function returned (LR was set to the `Emulator_Return_Trap` thunk). Frame complete; in the main loop this is the only halt that sets `main_thread_clean = true` and breaks out of the inner `cpu.Run()` loop.
+- `UserDefined2` — yield request from HLE (e.g. `nanosleep` / `usleep`). Main loop saves the guest's exact register state, breaks the inner loop, and lets SDL/idle yield for ~500 µs before next outer iteration restores and re-enters. Critically, `main_thread_clean` stays **false** so input dispatch waits.
+- `UserDefined3` — `pthread_once` finished its callback; restore `once_saved_state` (declared `thread_local` in `ThreadingHelpers.cpp`) and **continue the inner loop** without breaking — the original caller resumes inline.
+- Anything else (most commonly `halt == 0` = Dynarmic tick budget exhausted via `GetTicksRemaining`) also stays in the inner loop. The driver MUST treat budget exhaustion as "keep running" or a long guest function becomes hundreds of save/restore round-trips and runs ~300× slow.
 
 **`SyscallRouter`** (`src/SyscallRouter.hpp`) maps symbol name → `std::function<void(Jit*)>`. Always register with the `ROUTE_REGISTER(router, "name", lambda)` macro — it captures `__FILE__`/`__LINE__` so `DumpSyscallMap("syscalls.txt")` (written on boot) doubles as an HLE coverage map. Unregistered calls log `[UNIMPLEMENTED]` and return 0 in R0; add the stub to the appropriate `HLE::*` module rather than `main.cpp`.
 
@@ -47,18 +48,30 @@ The `page_table` array is handed to Dynarmic's fastmem path; `GetHostPointer` is
 
 **Threading** (`src/HLE/HLE_Threading.hpp`) spawns a real host `std::thread` for each guest `pthread_create`, allocates a fresh guest stack + TLS page, builds its own `Dynarmic::A32::Jit` with a unique `processor_id` and an `AndroidCP15` configured for that TLS, and shares the `ExclusiveMonitor` allocated in `main.cpp` (256-slot capacity). `AndroidCP15` (`src/AndroidCP15.hpp`) only implements the read of `c13, c0, opc1=0, opc2=3` (TPIDRURO) — that's how Bionic finds the per-thread TLS pointer.
 
-**`Watchpoint`** (`src/Watchpoint.hpp`) is a range-based diagnostic registry, not a feature: `HLE_Threading` adds/removes each guest pthread's stack range, `EmuCallbacks` calls `Find()` on every guest write to catch cross-thread writes into another thread's live stack, and `GuestMemory::AllocateHeap` checks `Find()` to detect heap blocks overlapping a still-live thread stack. Use it when chasing memory corruption that looks like a use-after-free or stack/heap collision.
+**`Watchpoint`** (`src/Watchpoint.hpp`) is a range-based diagnostic registry, not a feature: `HLE_Threading` adds/removes each guest pthread's stack range, `EmuCallbacks` calls `Find()` on every guest write to catch cross-thread writes into another thread's live stack, and `GuestMemory::AllocateHeap` checks `Find()` to detect heap blocks overlapping a still-live thread stack. Heap-vs-heap overlap is checked separately (always-on, O(log n) neighbor scan in `AllocateHeap`). Use these when chasing memory corruption that looks like a use-after-free or stack/heap collision.
+
+**`Pacing`** (`src/Pacing.hpp`) — global `std::atomic`s read by the main loop and written by HLE modules on guest-state triggers:
+- `game_tick_hz` (default 60) — how often the main loop invokes a guest tick. 0 = uncapped.
+- `display_hz` (default 60) — how often the main loop calls `SDL_GL_SwapWindow`.
+- `frame_dirty` — set by `glClear` / `glDrawElements` in `HLE_OpenGL`; cleared by the main loop on swap. Swap is gated on this so logic-only ticks don't ping-pong a stale back buffer.
+- `input_enabled` — flipped true by `HLE_Android`'s `__android_log_print` handler when it sees the Octarine log line `"TerrariaInitializer::Run() DONE"` (= main menu fully constructed). Until then, `Input::HandleSDLEvent` drops SDL events at the gate so we don't dispatch into half-built game state. A second one-shot trigger on `"Initialized achievement system"` bumps `game_tick_hz` to 60 once boot is past asset extraction.
+
+**`Input`** (`src/Input.hpp`) — translates SDL events to Octarine's JNI input. Single-finger touch (left mouse → `nativeTouchEvent` with action 0/1/2 = DOWN/UP/MOVE); keyboard via SDL keysym → AOSP `KeyEvent.KEYCODE_*` table → `nativeKeyEvent`. Special case: `keyCode == 66` (Enter) is rewritten to `(action=0, unicode='\n', keyCode=0)` because that's the magic 3-tuple Octarine's `onEditorAction` submits text with; see the in-game text-entry path. Events are queued in `std::deque`s; consecutive MOVEs coalesce to the latest position. `DrainPending` dispatches **at most one** touch + one key per main-loop iteration, gated on `main_thread_clean` — so `nativeOnUpdate` always drains the game's internal touch queue between additions. Dispatching a burst, or dispatching when `main_thread_clean` is false, corrupts the deque (see git log for the painful debugging session).
 
 ## Boot sequence in `main.cpp`
 
 Knowing this order is essential when debugging crashes:
-1. SDL2 + GLES2 context (1280×720), GLAD loader.
+1. SDL2 + GLES2 context (1280×720), GLAD loader, `SDL_GL_SetSwapInterval(0)` (we own pacing in software).
 2. `GuestMemory`, `ElfLoader::Load`, `SyscallRouter`, `ExclusiveMonitor(256)`, `AndroidEnvironment::RegisterAll` (dumps `syscalls.txt`).
-3. `EmuCallbacks` + Dynarmic `A32::Jit` for the main thread (`processor_id = 0`, ARMv7, fastmem disabled by default).
+3. `EmuCallbacks` + Dynarmic `A32::Jit` for the main thread (`processor_id = 0`, ARMv7). `config.fastmem_pointer` and `config.very_verbose_debugging_output` come from `Config::Performance::{fastmem, verboseDynarmic}`.
 4. Run every `DT_INIT_ARRAY` constructor via `ExecuteGameFunction`.
 5. Install JNI env (`JNIEmulator::Install`).
 6. Call the Java→native bridge in order: `nativeOnCreateActivity` → `nativeOnSurfaceChanged` → `nativeOnResizeSurface` → (optional) `nativeOnExpansionFileExtracted` / `nativeUnlockGame` / `nativeOnResume`.
-7. Main loop: poll SDL events, restore the saved `EmuThread` register file, `cpu.Run()`, save it back. On `UserDefined1` re-arm the registers to call `nativeOnUpdate(env, 0, 1, 1)` again, forcing CPSR Thumb bit because the return trap is ARM-mode.
+7. Main loop, per outer iteration:
+   - Poll SDL events; F1–F4 toggle pacing locally, everything else goes to `Input::HandleSDLEvent` (drops if `Pacing::input_enabled == false`).
+   - If `main_thread_clean`, call `Input::DrainPending` (dispatches at most one touch + one key via `ExecuteGameFunction`).
+   - If `tick_due` and `main_thread.is_alive`: set `main_thread_clean = false`, restore the saved register file, then **inner `while (true)` loop**: call `cpu.Run()` and dispatch on halt — `UserDefined1` re-arms `nativeOnUpdate(env, 0, 1, 1)` (force Thumb CPSR=0x30 because the return trap is ARM), sets `main_thread_clean = true`, and `break`s; `UserDefined2` saves state and `break`s (clean stays false); `UserDefined3` restores `once_saved_state` and continues without breaking; **any other halt (including `halt == 0` for tick-budget exhaustion) clears and continues without breaking**. Skipping that "keep running" rule on tick-exhaustion is the trap that previously caused 5-second loads and mid-frame input dispatch corrupting the touch deque.
+   - Swap only if `swap_due && Pacing::frame_dirty`. Idle-yield 500 µs if neither tick nor swap fired.
 
 ## Conventions
 
