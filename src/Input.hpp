@@ -80,11 +80,11 @@ namespace Input {
     };
     inline PadKeys pad_keys;
 
-    // "Latest wins" tiebreak: when both opposing keys are held, the more
-    // recently pressed one chooses direction. Cleared implicitly by
-    // RecomputeAxes (it only consults these when both keys are held).
+    // "Latest wins" tiebreak when both A and D are held -- the more recently
+    // pressed direction wins. Per request, this only applies to horizontal;
+    // vertical (W/S) uses simple cancellation (both held -> 0), since the
+    // user doesn't rely on dual-up/down hold behavior.
     inline SDL_Keycode last_horiz_press = 0; // SDLK_a or SDLK_d
-    inline SDL_Keycode last_vert_press  = 0; // SDLK_w or SDLK_s
 
     inline void RecomputeAxes() {
         if (pad_keys.a && pad_keys.d) {
@@ -96,43 +96,48 @@ namespace Input {
         } else {
             pad_state.AxisX = 0.0f;
         }
-        if (pad_keys.w && pad_keys.s) {
-            pad_state.AxisY = (last_vert_press == SDLK_s) ?  1.0f : -1.0f;
-        } else if (pad_keys.s) {
-            pad_state.AxisY =  1.0f;
-        } else if (pad_keys.w) {
-            pad_state.AxisY = -1.0f;
-        } else {
-            pad_state.AxisY = 0.0f;
-        }
+        // Vertical: simple cancellation, no latest-wins.
+        pad_state.AxisY = (pad_keys.s ? 1.0f : 0.0f) - (pad_keys.w ? 1.0f : 0.0f);
     }
 
-    // SDL key -> pad action. WASD updates analog-stick axes (NOT the d-pad
-    // -- the engine uses d-pad for menu/minimap, not motion). All other
-    // mapped keys queue a single-frame pulse; key-release is intentionally
-    // ignored for those, since the pulse self-clears on the next send.
+    // SDL key -> pad action. WASD writes BOTH the analog stick (held, for
+    // continuous in-game motion) AND the d-pad (held, for menu nav). The
+    // engine appears to edge-detect d-pad internally -- holding a dpad
+    // direction only triggers one nav event -- so held semantics are safe
+    // here. We can't drop the d-pad: on the main menu, only the d-pad path
+    // has proper edge detection. Pressing 's' with only AxisY (no
+    // DpadDown) causes the menu's axis-handler to scroll the item array
+    // every tick, walking off the end and jumping into garbage.
     //
-    // Edit this switch to remap; the SDLK_* constants make it self-documenting.
+    // Side effect: in-game, pressing 's' will also fire whatever the
+    // engine binds to dpad-down (opens minimap, etc.). We'll address that
+    // separately (asset replacement or remapping) -- the crash takes
+    // priority.
+    //
+    // Action / menu buttons remain pulse-only (one frame of "1") because
+    // the engine does NOT edge-detect those.
     inline bool ApplyPadKey(SDL_Keycode sym, bool down) {
         switch (sym) {
-            // Movement (axes, held)
+            // Movement: axes held, dpad held.
             case SDLK_w:
                 pad_keys.w = down;
-                if (down) last_vert_press = SDLK_w;
+                pad_state.DpadUp = down ? 1 : 0;
                 RecomputeAxes();
                 return true;
             case SDLK_s:
                 pad_keys.s = down;
-                if (down) last_vert_press = SDLK_s;
+                pad_state.DpadDown = down ? 1 : 0;
                 RecomputeAxes();
                 return true;
             case SDLK_a:
                 pad_keys.a = down;
+                pad_state.DpadLeft = down ? 1 : 0;
                 if (down) last_horiz_press = SDLK_a;
                 RecomputeAxes();
                 return true;
             case SDLK_d:
                 pad_keys.d = down;
+                pad_state.DpadRight = down ? 1 : 0;
                 if (down) last_horiz_press = SDLK_d;
                 RecomputeAxes();
                 return true;
@@ -366,12 +371,16 @@ namespace Input {
     inline void SendGamepadUpdate(Dynarmic::A32::Jit& cpu, GuestMemory& memory,
                                   ElfLoader& loader, uint32_t env_ptr) {
         Pad to_send{};
-        // Axes from live state
-        to_send.AxisX  = pad_state.AxisX;
-        to_send.AxisY  = pad_state.AxisY;
-        to_send.AxisZ  = pad_state.AxisZ;
-        to_send.AxisRZ = pad_state.AxisRZ;
-        // Buttons from the pulse queue
+        // Axes and d-pad from live state (held semantics)
+        to_send.AxisX     = pad_state.AxisX;
+        to_send.AxisY     = pad_state.AxisY;
+        to_send.AxisZ     = pad_state.AxisZ;
+        to_send.AxisRZ    = pad_state.AxisRZ;
+        to_send.DpadUp    = pad_state.DpadUp;
+        to_send.DpadDown  = pad_state.DpadDown;
+        to_send.DpadLeft  = pad_state.DpadLeft;
+        to_send.DpadRight = pad_state.DpadRight;
+        // Action buttons from the pulse queue (one-shot)
         to_send.A         = pad_pulse.A;
         to_send.B         = pad_pulse.B;
         to_send.X         = pad_pulse.X;
@@ -382,10 +391,6 @@ namespace Input {
         to_send.R1        = pad_pulse.R1;
         to_send.R2        = pad_pulse.R2;
         to_send.R3        = pad_pulse.R3;
-        to_send.DpadUp    = pad_pulse.DpadUp;
-        to_send.DpadDown  = pad_pulse.DpadDown;
-        to_send.DpadLeft  = pad_pulse.DpadLeft;
-        to_send.DpadRight = pad_pulse.DpadRight;
         to_send.Start     = pad_pulse.Start;
 
         if (pad_ever_sent && std::memcmp(&to_send, &pad_last_sent, sizeof(Pad)) == 0) {
