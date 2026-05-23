@@ -131,6 +131,19 @@ namespace HLE::Memory {
             cpu->Regs()[0] = dest;
         });
 
+        ROUTE_REGISTER(router, "wmemmove", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t dest = cpu->Regs()[0];
+            uint32_t src = cpu->Regs()[1];
+            uint32_t n = cpu->Regs()[2];
+
+            std::wmemmove(
+                reinterpret_cast<wchar_t*>(memory.GetHostPointer(dest)),
+                reinterpret_cast<const wchar_t*>(memory.GetHostPointer(src)),
+                n
+            );
+            cpu->Regs()[0] = dest;
+        });
+
         ROUTE_REGISTER(router, "wmemset", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t dest = cpu->Regs()[0];
             wchar_t ch = static_cast<wchar_t>(cpu->Regs()[1]);

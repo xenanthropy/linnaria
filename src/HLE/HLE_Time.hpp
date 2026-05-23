@@ -3,6 +3,9 @@
 #include "GuestMemory.hpp"
 #include <sys/time.h>
 #include <chrono>
+#include <ctime>
+#include <cstring>
+#include <vector>
 
 namespace HLE::Time {
 
@@ -88,6 +91,42 @@ namespace HLE::Time {
             memory.Write32(result_ptr + 40, 0); // tm_zone (null)
 
             cpu->Regs()[0] = result_ptr;
+        });
+
+        ROUTE_REGISTER(router, "strftime", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t out_ptr  = cpu->Regs()[0];
+            uint32_t max      = cpu->Regs()[1];
+            uint32_t fmt_ptr  = cpu->Regs()[2];
+            uint32_t tm_ptr   = cpu->Regs()[3];
+
+            if (out_ptr == 0 || max == 0 || fmt_ptr == 0 || tm_ptr == 0) {
+                cpu->Regs()[0] = 0;
+                return;
+            }
+
+            // Guest struct tm is the Bionic 44-byte layout (see gmtime_r above).
+            struct tm host_tm{};
+            host_tm.tm_sec   = static_cast<int>(memory.Read32(tm_ptr + 0));
+            host_tm.tm_min   = static_cast<int>(memory.Read32(tm_ptr + 4));
+            host_tm.tm_hour  = static_cast<int>(memory.Read32(tm_ptr + 8));
+            host_tm.tm_mday  = static_cast<int>(memory.Read32(tm_ptr + 12));
+            host_tm.tm_mon   = static_cast<int>(memory.Read32(tm_ptr + 16));
+            host_tm.tm_year  = static_cast<int>(memory.Read32(tm_ptr + 20));
+            host_tm.tm_wday  = static_cast<int>(memory.Read32(tm_ptr + 24));
+            host_tm.tm_yday  = static_cast<int>(memory.Read32(tm_ptr + 28));
+            host_tm.tm_isdst = static_cast<int>(memory.Read32(tm_ptr + 32));
+
+            const char* fmt = reinterpret_cast<const char*>(memory.GetHostPointer(fmt_ptr));
+
+            std::vector<char> buf(max);
+            size_t n = std::strftime(buf.data(), max, fmt, &host_tm);
+
+            if (n > 0) {
+                std::memcpy(memory.GetHostPointer(out_ptr), buf.data(), n + 1); // include NUL
+            } else if (max > 0) {
+                memory.Write8(out_ptr, 0); // strftime ran out of room: leave buffer terminated
+            }
+            cpu->Regs()[0] = static_cast<uint32_t>(n);
         });
 
     }
