@@ -512,12 +512,15 @@ int main(int argc, char** argv) {
             bool swap_due = (display_hz   == 0) || (now - last_swap >= 1000u / display_hz);
 
             if (tick_due && main_thread.is_alive) {
-                // Ship one gamepad snapshot per tick. Doing this between
-                // ticks would let a pulse-on / pulse-off pair land in the
-                // same inter-tick window, and the engine would see only
-                // the pulse-off. main_thread_clean is still true here, so
-                // ExecuteGameFunction can safely reuse the main stack.
-                Input::SendGamepadUpdate(cpu, memory, loader, env_ptr);
+                // Ship one gamepad snapshot per tick. Gated on main_thread_clean
+                // because ExecuteGameFunction resets SP to the main stack base
+                // and would trample a yielded nativeOnUpdate's live frame
+                // otherwise (same invariant as DrainPending). Skipping a send
+                // during a yield is fine -- the engine retains the last sent
+                // Gamepad state and we'll catch up on the next clean tick.
+                if (main_thread_clean) {
+                    Input::SendGamepadUpdate(cpu, memory, loader, env_ptr);
+                }
 
                 // Lock out input dispatch while the thread is working or suspended
                 main_thread_clean = false;

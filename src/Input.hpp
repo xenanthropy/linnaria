@@ -74,9 +74,11 @@ namespace Input {
     inline Pad pad_last_sent;
     inline bool pad_ever_sent = false;
 
-    // Live held state for movement keys.
+    // Live held state for keys that need held semantics (axes, jump).
     struct PadKeys {
         bool w = false, a = false, s = false, d = false;
+        bool jump = false;  // Space -- held so the engine can extend the jump
+                            // for the full duration the key is pressed.
     };
     inline PadKeys pad_keys;
 
@@ -96,11 +98,14 @@ namespace Input {
         } else {
             pad_state.AxisX = 0.0f;
         }
+        // The engine expects +Y = up (matching the Java path, which ships
+        // AxisY * -1 to invert Android's screen-down convention). So W
+        // (player intends up) sends +1, S sends -1.
         if (pad_keys.w && pad_keys.s) {
-            pad_state.AxisY = (last_vert_press == SDLK_s) ?  1.0f : -1.0f;
-        } else if (pad_keys.s) {
-            pad_state.AxisY =  1.0f;
+            pad_state.AxisY = (last_vert_press == SDLK_s) ? -1.0f :  1.0f;
         } else if (pad_keys.w) {
+            pad_state.AxisY =  1.0f;
+        } else if (pad_keys.s) {
             pad_state.AxisY = -1.0f;
         } else {
             pad_state.AxisY = 0.0f;
@@ -136,8 +141,15 @@ namespace Input {
                 if (down) last_horiz_press = SDLK_d;
                 RecomputeAxes();
                 return true;
+            // Jump -- HELD: A=1 every frame the key is down so the engine
+            // can extend jump height for the duration of the hold. Toggle-
+            // style actions (menu, inventory) below stay pulse so they
+            // don't flicker.
+            case SDLK_SPACE:
+                pad_keys.jump = down;
+                pad_state.A = down ? 1 : 0;
+                return true;
             // Action / menu (one-frame pulses on key-down only)
-            case SDLK_SPACE:  if (down) pad_pulse.A     = 1; return true;
             case SDLK_e:      if (down) pad_pulse.B     = 1; return true;
             case SDLK_f:      if (down) pad_pulse.X     = 1; return true;
             case SDLK_TAB:    if (down) pad_pulse.Y     = 1; return true;
@@ -371,8 +383,9 @@ namespace Input {
         to_send.AxisY  = pad_state.AxisY;
         to_send.AxisZ  = pad_state.AxisZ;
         to_send.AxisRZ = pad_state.AxisRZ;
-        // Buttons from the pulse queue
-        to_send.A         = pad_pulse.A;
+        // Held buttons (A = jump) from live state
+        to_send.A         = pad_state.A;
+        // Pulse buttons from the one-shot queue
         to_send.B         = pad_pulse.B;
         to_send.X         = pad_pulse.X;
         to_send.Y         = pad_pulse.Y;
