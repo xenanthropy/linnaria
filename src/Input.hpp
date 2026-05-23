@@ -157,8 +157,17 @@ namespace Input {
                 if (ev.key.repeat) break;
                 int code = SDLKeyToAndroid(ev.key.keysym.sym);
                 if (code == 0) break;
-                uint32_t unicode = (ev.key.keysym.sym < 128)
-                    ? static_cast<uint32_t>(ev.key.keysym.sym) : 0u;
+
+                uint32_t unicode;
+                if (code == 66) {
+                    unicode = '\n';
+                    code = 0;
+                } else if (ev.key.keysym.sym < 128) {
+                    unicode = static_cast<uint32_t>(ev.key.keysym.sym);
+                } else {
+                    unicode = 0u;
+                }
+
                 key_queue.push_back({0, unicode, code});
                 break;
             }
