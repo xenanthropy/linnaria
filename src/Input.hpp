@@ -41,6 +41,50 @@ namespace Input {
     // which can't generate hover-MOVE on a touchscreen).
     inline bool mouse_held = false;
 
+    // Gamepad state. Mirrors the Java ShieldController fields one-for-one;
+    // shipped to the engine via nativeGamePadUpdate (which builds a fresh
+    // Gamepad each call, populates it, and feeds AndroidInterface::fjAddGamePad).
+    // We emulate the Shield path because it's pure-Java keystroke aggregation
+    // and the engine is already wired to consume it.
+    struct Pad {
+        int A = 0, B = 0, X = 0, Y = 0;
+        int L1 = 0, L2 = 0, L3 = 0;
+        int R1 = 0, R2 = 0, R3 = 0;
+        int DpadUp = 0, DpadDown = 0, DpadLeft = 0, DpadRight = 0;
+        int Start = 0;
+        float AxisX = 0.0f, AxisY = 0.0f;   // left stick
+        float AxisZ = 0.0f, AxisRZ = 0.0f;  // right stick
+    };
+    inline Pad pad_state;
+    inline Pad pad_last_sent;
+    inline bool pad_ever_sent = false;
+
+    // Returns true if this key drives a gamepad field (regardless of whether
+    // we changed state -- holding the key down past auto-repeat re-sets the
+    // same value, but the on-change gate in SendGamepadUpdate filters dupes).
+    // WASD drives both the d-pad and the analog stick: the engine tends to
+    // use the stick for actor motion and the d-pad for UI nav, so feed both
+    // and let it pick.
+    inline bool ApplyPadKey(SDL_Keycode sym, bool down) {
+        const int b = down ? 1 : 0;
+        const float a_pos = down ?  1.0f : 0.0f;
+        const float a_neg = down ? -1.0f : 0.0f;
+        switch (sym) {
+            case SDLK_w: pad_state.DpadUp    = b; pad_state.AxisY = a_neg; return true;
+            case SDLK_s: pad_state.DpadDown  = b; pad_state.AxisY = a_pos; return true;
+            case SDLK_a: pad_state.DpadLeft  = b; pad_state.AxisX = a_neg; return true;
+            case SDLK_d: pad_state.DpadRight = b; pad_state.AxisX = a_pos; return true;
+            case SDLK_SPACE:  pad_state.A     = b; return true;  // jump
+            case SDLK_e:      pad_state.B     = b; return true;  // interact / use
+            case SDLK_f:      pad_state.X     = b; return true;
+            case SDLK_TAB:    pad_state.Y     = b; return true;  // inventory
+            case SDLK_q:      pad_state.L1    = b; return true;  // hotbar prev
+            case SDLK_r:      pad_state.R1    = b; return true;  // hotbar next
+            case SDLK_ESCAPE: pad_state.Start = b; return true;  // pause
+            default: return false;
+        }
+    }
+
     // SDL keysym -> Android KeyEvent.KEYCODE_*. Values from the AOSP
     // KeyEvent source. Unmapped keys return 0 and are skipped at dispatch.
     inline int SDLKeyToAndroid(SDL_Keycode sym) {
@@ -155,6 +199,8 @@ namespace Input {
                 break;
             case SDL_KEYDOWN: {
                 if (ev.key.repeat) break;
+                ApplyPadKey(ev.key.keysym.sym, true);
+
                 int code = SDLKeyToAndroid(ev.key.keysym.sym);
                 if (code == 0) break;
 
@@ -172,6 +218,8 @@ namespace Input {
                 break;
             }
             case SDL_KEYUP: {
+                ApplyPadKey(ev.key.keysym.sym, false);
+
                 int code = SDLKeyToAndroid(ev.key.keysym.sym);
                 if (code == 0) break;
                 uint32_t unicode = (ev.key.keysym.sym < 128)
@@ -226,5 +274,66 @@ namespace Input {
                   static_cast<uint32_t>(k.keyCode) },
                 /*verbose=*/false);
         }
+    }
+
+    // Push the current pad state to the engine via nativeGamePadUpdate. The
+    // native side constructs a fresh Gamepad each call, calls SetConnected(true)
+    // unconditionally, and feeds AndroidInterface::fjAddGamePad -- so there's
+    // no "controller registration" handshake; every call is self-contained.
+    //
+    // Caller MUST guarantee main_thread_clean == true (same gate as DrainPending).
+    //
+    // We send only when state changed since the last call. The engine stores
+    // the most recent Gamepad and uses it on subsequent frames, so a held key
+    // produces continuous motion without re-sends.
+    //
+    // Arg ordering matches the Java OctarineBridge.nativeGamePadUpdate(...) call
+    // in Gamepad.UpdateControllerData(). productVersion is the Shield's value (1).
+    // Note: L2 and R2 are typed `int` in Java but read as `float` by the native
+    // side -- a known mobile-port type mismatch that effectively zeroes those
+    // triggers. We match Java's behavior and pass int bit-patterns.
+    inline void SendGamepadUpdate(Dynarmic::A32::Jit& cpu, GuestMemory& memory,
+                                  ElfLoader& loader, uint32_t env_ptr) {
+        if (pad_ever_sent && std::memcmp(&pad_state, &pad_last_sent, sizeof(Pad)) == 0) {
+            return; // nothing changed
+        }
+
+        auto fbits = [](float f) -> uint32_t {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return u;
+        };
+
+        ExecuteGameFunction(cpu, memory, loader,
+            "Java_com_codeglue_terraria_OctarineBridge_nativeGamePadUpdate",
+            {
+                env_ptr,
+                0u,                              // jclass (unused by native)
+                1u,                              // productVersion (Shield)
+                0u,                              // 2nd Java arg, clobbered on entry
+                static_cast<uint32_t>(pad_state.A),
+                static_cast<uint32_t>(pad_state.B),
+                static_cast<uint32_t>(pad_state.X),
+                static_cast<uint32_t>(pad_state.Y),
+                static_cast<uint32_t>(pad_state.L1),
+                static_cast<uint32_t>(pad_state.L2),
+                static_cast<uint32_t>(pad_state.L3),
+                static_cast<uint32_t>(pad_state.R1),
+                static_cast<uint32_t>(pad_state.R2),
+                static_cast<uint32_t>(pad_state.R3),
+                static_cast<uint32_t>(pad_state.DpadUp),
+                static_cast<uint32_t>(pad_state.DpadDown),
+                static_cast<uint32_t>(pad_state.DpadLeft),
+                static_cast<uint32_t>(pad_state.DpadRight),
+                fbits(pad_state.AxisX),
+                fbits(pad_state.AxisY),
+                fbits(pad_state.AxisZ),
+                fbits(pad_state.AxisRZ),
+                static_cast<uint32_t>(pad_state.Start),
+            },
+            /*verbose=*/false);
+
+        pad_last_sent = pad_state;
+        pad_ever_sent = true;
     }
 }

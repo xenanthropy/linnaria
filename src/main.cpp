@@ -503,6 +503,7 @@ int main(int argc, char** argv) {
             //         don't trample a paused frame on the shared stack. ---
             if (main_thread_clean) {
                 Input::DrainPending(cpu, memory, loader, env_ptr);
+                Input::SendGamepadUpdate(cpu, memory, loader, env_ptr);
             }
 
             uint32_t game_tick_hz = Pacing::game_tick_hz.load();
