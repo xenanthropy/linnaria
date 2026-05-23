@@ -334,14 +334,35 @@ int main(int argc, char** argv) {
         std::memcpy(&cmH, &f_cmH, 4);
         std::memcpy(&diag, &f_diag, 4);
 
-        ExecuteGameFunction(cpu, memory, loader, 
-            "Java_com_codeglue_terraria_OctarineBridge_nativeOnResizeSurface", 
+        ExecuteGameFunction(cpu, memory, loader,
+            "Java_com_codeglue_terraria_OctarineBridge_nativeOnResizeSurface",
             { env_ptr, 0, 1280, 720, cmW, cmH, diag }
             // DEBUG: test bigger resolution when necessary (1920x1080 screen)
             //{ env_ptr, 0, 1920, 1080, cmW, cmH, diag }
         );
 
-        // IGNORE: was experimenting with nativeOnExpansionFileExtracted and nativeUnlockGame
+        // Lie to AndroidInterface::CheckMemoryInfo so extended worlds unlock.
+        // JNI sig: setMemoryInformation(JNIEnv*, jobject, jdouble mb, jdouble totalRamKb).
+        // AAPCS soft-float: mb -> R2:R3 (even-aligned pair), totalRamKb -> [SP+0:+4].
+        // We pretend the device has 4 GiB: mb = 4096.0, totalRamKb = 4194304.0.
+        {
+            double mb_val = 4096.0;
+            double total_ram_kb_val = 4194304.0;
+            uint64_t mb_bits, total_bits;
+            std::memcpy(&mb_bits, &mb_val, 8);
+            std::memcpy(&total_bits, &total_ram_kb_val, 8);
+            uint32_t mb_lo    = static_cast<uint32_t>(mb_bits);
+            uint32_t mb_hi    = static_cast<uint32_t>(mb_bits >> 32);
+            uint32_t total_lo = static_cast<uint32_t>(total_bits);
+            uint32_t total_hi = static_cast<uint32_t>(total_bits >> 32);
+
+            ExecuteGameFunction(cpu, memory, loader,
+                "Java_com_codeglue_terraria_OctarineBridge_setMemoryInformation",
+                { env_ptr, 0, mb_lo, mb_hi, total_lo, total_hi }
+            );
+        }
+
+        // Tells game where obb file was extracted to (in our case, our local ./obb)
         uint32_t fake_path_ptr = memory.AllocateHeap(64);
         std::strcpy(reinterpret_cast<char*>(memory.GetHostPointer(fake_path_ptr)), "./obb");
         uint32_t on_expansion_extracted = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted");
