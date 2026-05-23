@@ -503,7 +503,6 @@ int main(int argc, char** argv) {
             //         don't trample a paused frame on the shared stack. ---
             if (main_thread_clean) {
                 Input::DrainPending(cpu, memory, loader, env_ptr);
-                Input::SendGamepadUpdate(cpu, memory, loader, env_ptr);
             }
 
             uint32_t game_tick_hz = Pacing::game_tick_hz.load();
@@ -513,6 +512,13 @@ int main(int argc, char** argv) {
             bool swap_due = (display_hz   == 0) || (now - last_swap >= 1000u / display_hz);
 
             if (tick_due && main_thread.is_alive) {
+                // Ship one gamepad snapshot per tick. Doing this between
+                // ticks would let a pulse-on / pulse-off pair land in the
+                // same inter-tick window, and the engine would see only
+                // the pulse-off. main_thread_clean is still true here, so
+                // ExecuteGameFunction can safely reuse the main stack.
+                Input::SendGamepadUpdate(cpu, memory, loader, env_ptr);
+
                 // Lock out input dispatch while the thread is working or suspended
                 main_thread_clean = false;
 

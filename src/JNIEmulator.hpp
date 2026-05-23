@@ -60,6 +60,8 @@ public:
         mem.Write32(table_ptr + (92 * 4), loader.GetThunk("JNI_CallNonvirtualVoidMethodV"));
         mem.Write32(table_ptr + (118 * 4), loader.GetThunk("JNI_CallStaticBooleanMethodV"));
         mem.Write32(table_ptr + (130 * 4), loader.GetThunk("JNI_CallStaticIntMethodV"));
+        mem.Write32(table_ptr + (23 * 4),  loader.GetThunk("JNI_DeleteLocalRef"));
+        mem.Write32(table_ptr + (167 * 4), loader.GetThunk("JNI_NewStringUTF"));
         mem.Write32(table_ptr + (169 * 4), loader.GetThunk("JNI_GetStringUTFChars"));
         mem.Write32(table_ptr + (170 * 4), loader.GetThunk("JNI_ReleaseStringUTFChars"));
         mem.Write32(table_ptr + (176 * 4), loader.GetThunk("JNI_NewByteArray"));
@@ -74,11 +76,23 @@ public:
         ROUTE_REGISTER(router, "JNI_GetStringUTFChars", [&mem](Dynarmic::A32::Jit* cpu) {
             uint32_t jstr_ptr = cpu->Regs()[1];
             uint32_t isCopy_ptr = cpu->Regs()[2];
-            if (isCopy_ptr != 0) mem.Write8(isCopy_ptr, 0); 
-            cpu->Regs()[0] = jstr_ptr; 
+            if (isCopy_ptr != 0) mem.Write8(isCopy_ptr, 0);
+            cpu->Regs()[0] = jstr_ptr;
         });
 
         ROUTE_REGISTER(router, "JNI_ReleaseStringUTFChars", [](Dynarmic::A32::Jit* cpu) {});
+
+        // NewStringUTF(env, const char* utf) -> jstring. We don't have real
+        // Java string objects; the existing GetStringUTFChars handler just
+        // returns the jstring pointer back as the char*, so we can do the
+        // inverse here: hand back the input C string as the "jstring", and
+        // any later GetStringUTFChars on it round-trips correctly.
+        ROUTE_REGISTER(router, "JNI_NewStringUTF", [](Dynarmic::A32::Jit* cpu) {
+            cpu->Regs()[0] = cpu->Regs()[1];
+        });
+
+        // DeleteLocalRef(env, local_ref) -> void. We don't track JNI refs.
+        ROUTE_REGISTER(router, "JNI_DeleteLocalRef", [](Dynarmic::A32::Jit* cpu) {});
 
         ROUTE_REGISTER(router, "JNI_RegisterNatives", [&mem](Dynarmic::A32::Jit* cpu) {
             cpu->Regs()[0] = 0; 

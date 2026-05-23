@@ -41,46 +41,109 @@ namespace Input {
     // which can't generate hover-MOVE on a touchscreen).
     inline bool mouse_held = false;
 
-    // Gamepad state. Mirrors the Java ShieldController fields one-for-one;
-    // shipped to the engine via nativeGamePadUpdate (which builds a fresh
-    // Gamepad each call, populates it, and feeds AndroidInterface::fjAddGamePad).
-    // We emulate the Shield path because it's pure-Java keystroke aggregation
-    // and the engine is already wired to consume it.
+    // Gamepad state. The engine consumes nativeGamePadUpdate as a single
+    // "snapshot per tick" -- mirrors the Java ShieldController -> Gamepad
+    // -> AndroidInterface::fjAddGamePad pipeline.
+    //
+    // Two state regimes:
+    //   * Axes (AxisX/Y/Z/RZ) -- HELD: the value persists until the key is
+    //     released. Recomputed from a per-key boolean (PadKeys) so two
+    //     opposing keys held simultaneously don't lose state when one is
+    //     released ("hold A, hold D, release D -> resume walking left").
+    //   * Buttons (A/B/X/Y/L*/R*/Dpad*/Start) -- PULSE: one frame of "1",
+    //     then "0" until the key is released and pressed again. The engine
+    //     re-reads the stored Gamepad on every internal tick and treats a
+    //     non-zero button as "freshly pressed", so a HELD button would
+    //     trigger that action every tick (menu flicker, hotbar auto-cycle).
+    //     Pulse semantics emit one event per physical press regardless of
+    //     hold duration.
     struct Pad {
         int A = 0, B = 0, X = 0, Y = 0;
         int L1 = 0, L2 = 0, L3 = 0;
         int R1 = 0, R2 = 0, R3 = 0;
         int DpadUp = 0, DpadDown = 0, DpadLeft = 0, DpadRight = 0;
         int Start = 0;
-        float AxisX = 0.0f, AxisY = 0.0f;   // left stick
-        float AxisZ = 0.0f, AxisRZ = 0.0f;  // right stick
+        float AxisX = 0.0f, AxisY = 0.0f;
+        float AxisZ = 0.0f, AxisRZ = 0.0f;
     };
+
+    // pad_state: only the axis fields are read out -- button fields here are
+    // unused. The button fields of the snapshot we send come from pad_pulse.
     inline Pad pad_state;
+    inline Pad pad_pulse;          // pending one-shot button pulses
     inline Pad pad_last_sent;
     inline bool pad_ever_sent = false;
 
-    // Returns true if this key drives a gamepad field (regardless of whether
-    // we changed state -- holding the key down past auto-repeat re-sets the
-    // same value, but the on-change gate in SendGamepadUpdate filters dupes).
-    // WASD drives both the d-pad and the analog stick: the engine tends to
-    // use the stick for actor motion and the d-pad for UI nav, so feed both
-    // and let it pick.
+    // Live held state for movement keys.
+    struct PadKeys {
+        bool w = false, a = false, s = false, d = false;
+    };
+    inline PadKeys pad_keys;
+
+    // "Latest wins" tiebreak: when both opposing keys are held, the more
+    // recently pressed one chooses direction. Cleared implicitly by
+    // RecomputeAxes (it only consults these when both keys are held).
+    inline SDL_Keycode last_horiz_press = 0; // SDLK_a or SDLK_d
+    inline SDL_Keycode last_vert_press  = 0; // SDLK_w or SDLK_s
+
+    inline void RecomputeAxes() {
+        if (pad_keys.a && pad_keys.d) {
+            pad_state.AxisX = (last_horiz_press == SDLK_d) ?  1.0f : -1.0f;
+        } else if (pad_keys.d) {
+            pad_state.AxisX =  1.0f;
+        } else if (pad_keys.a) {
+            pad_state.AxisX = -1.0f;
+        } else {
+            pad_state.AxisX = 0.0f;
+        }
+        if (pad_keys.w && pad_keys.s) {
+            pad_state.AxisY = (last_vert_press == SDLK_s) ?  1.0f : -1.0f;
+        } else if (pad_keys.s) {
+            pad_state.AxisY =  1.0f;
+        } else if (pad_keys.w) {
+            pad_state.AxisY = -1.0f;
+        } else {
+            pad_state.AxisY = 0.0f;
+        }
+    }
+
+    // SDL key -> pad action. WASD updates analog-stick axes (NOT the d-pad
+    // -- the engine uses d-pad for menu/minimap, not motion). All other
+    // mapped keys queue a single-frame pulse; key-release is intentionally
+    // ignored for those, since the pulse self-clears on the next send.
+    //
+    // Edit this switch to remap; the SDLK_* constants make it self-documenting.
     inline bool ApplyPadKey(SDL_Keycode sym, bool down) {
-        const int b = down ? 1 : 0;
-        const float a_pos = down ?  1.0f : 0.0f;
-        const float a_neg = down ? -1.0f : 0.0f;
         switch (sym) {
-            case SDLK_w: pad_state.DpadUp    = b; pad_state.AxisY = a_neg; return true;
-            case SDLK_s: pad_state.DpadDown  = b; pad_state.AxisY = a_pos; return true;
-            case SDLK_a: pad_state.DpadLeft  = b; pad_state.AxisX = a_neg; return true;
-            case SDLK_d: pad_state.DpadRight = b; pad_state.AxisX = a_pos; return true;
-            case SDLK_SPACE:  pad_state.A     = b; return true;  // jump
-            case SDLK_e:      pad_state.B     = b; return true;  // interact / use
-            case SDLK_f:      pad_state.X     = b; return true;
-            case SDLK_TAB:    pad_state.Y     = b; return true;  // inventory
-            case SDLK_q:      pad_state.L1    = b; return true;  // hotbar prev
-            case SDLK_r:      pad_state.R1    = b; return true;  // hotbar next
-            case SDLK_ESCAPE: pad_state.Start = b; return true;  // pause
+            // Movement (axes, held)
+            case SDLK_w:
+                pad_keys.w = down;
+                if (down) last_vert_press = SDLK_w;
+                RecomputeAxes();
+                return true;
+            case SDLK_s:
+                pad_keys.s = down;
+                if (down) last_vert_press = SDLK_s;
+                RecomputeAxes();
+                return true;
+            case SDLK_a:
+                pad_keys.a = down;
+                if (down) last_horiz_press = SDLK_a;
+                RecomputeAxes();
+                return true;
+            case SDLK_d:
+                pad_keys.d = down;
+                if (down) last_horiz_press = SDLK_d;
+                RecomputeAxes();
+                return true;
+            // Action / menu (one-frame pulses on key-down only)
+            case SDLK_SPACE:  if (down) pad_pulse.A     = 1; return true;
+            case SDLK_e:      if (down) pad_pulse.B     = 1; return true;
+            case SDLK_f:      if (down) pad_pulse.X     = 1; return true;
+            case SDLK_TAB:    if (down) pad_pulse.Y     = 1; return true;
+            case SDLK_q:      if (down) pad_pulse.L1    = 1; return true;
+            case SDLK_r:      if (down) pad_pulse.R1    = 1; return true;
+            case SDLK_ESCAPE: if (down) pad_pulse.Start = 1; return true;
             default: return false;
         }
     }
@@ -276,26 +339,57 @@ namespace Input {
         }
     }
 
-    // Push the current pad state to the engine via nativeGamePadUpdate. The
-    // native side constructs a fresh Gamepad each call, calls SetConnected(true)
-    // unconditionally, and feeds AndroidInterface::fjAddGamePad -- so there's
-    // no "controller registration" handshake; every call is self-contained.
+    // Push the current pad state to the engine via nativeGamePadUpdate.
     //
-    // Caller MUST guarantee main_thread_clean == true (same gate as DrainPending).
+    // Composes the snapshot from two sources:
+    //   * Axes -- from pad_state, the live held-direction signal.
+    //   * Buttons -- from pad_pulse, the per-press one-shot queue (cleared
+    //     after this call). On the *next* call, button fields will be 0,
+    //     which differs from last_sent (which had them at 1), so the
+    //     pulse-off update fires automatically and the engine sees a clean
+    //     press-then-release pair.
     //
-    // We send only when state changed since the last call. The engine stores
-    // the most recent Gamepad and uses it on subsequent frames, so a held key
-    // produces continuous motion without re-sends.
+    // Called once per game tick (NOT per outer-loop iteration). Two sends
+    // in the same inter-tick window would let the pulse-off overwrite the
+    // pulse-on before the engine processed either; one-per-tick guarantees
+    // the engine consumes each snapshot before the next overwrites it.
     //
-    // Arg ordering matches the Java OctarineBridge.nativeGamePadUpdate(...) call
-    // in Gamepad.UpdateControllerData(). productVersion is the Shield's value (1).
-    // Note: L2 and R2 are typed `int` in Java but read as `float` by the native
-    // side -- a known mobile-port type mismatch that effectively zeroes those
-    // triggers. We match Java's behavior and pass int bit-patterns.
+    // Caller MUST guarantee main_thread_clean == true so that
+    // ExecuteGameFunction's reuse of the main stack doesn't trample a paused
+    // nativeOnUpdate frame.
+    //
+    // Arg ordering matches the Java OctarineBridge.nativeGamePadUpdate(...)
+    // call in Gamepad.UpdateControllerData(); productVersion is the Shield's
+    // value (1). L2 and R2 are typed `int` in Java but read as `float` by
+    // native -- a known mobile-port mismatch that effectively zeros those
+    // triggers. We match Java's bit pattern.
     inline void SendGamepadUpdate(Dynarmic::A32::Jit& cpu, GuestMemory& memory,
                                   ElfLoader& loader, uint32_t env_ptr) {
-        if (pad_ever_sent && std::memcmp(&pad_state, &pad_last_sent, sizeof(Pad)) == 0) {
-            return; // nothing changed
+        Pad to_send{};
+        // Axes from live state
+        to_send.AxisX  = pad_state.AxisX;
+        to_send.AxisY  = pad_state.AxisY;
+        to_send.AxisZ  = pad_state.AxisZ;
+        to_send.AxisRZ = pad_state.AxisRZ;
+        // Buttons from the pulse queue
+        to_send.A         = pad_pulse.A;
+        to_send.B         = pad_pulse.B;
+        to_send.X         = pad_pulse.X;
+        to_send.Y         = pad_pulse.Y;
+        to_send.L1        = pad_pulse.L1;
+        to_send.L2        = pad_pulse.L2;
+        to_send.L3        = pad_pulse.L3;
+        to_send.R1        = pad_pulse.R1;
+        to_send.R2        = pad_pulse.R2;
+        to_send.R3        = pad_pulse.R3;
+        to_send.DpadUp    = pad_pulse.DpadUp;
+        to_send.DpadDown  = pad_pulse.DpadDown;
+        to_send.DpadLeft  = pad_pulse.DpadLeft;
+        to_send.DpadRight = pad_pulse.DpadRight;
+        to_send.Start     = pad_pulse.Start;
+
+        if (pad_ever_sent && std::memcmp(&to_send, &pad_last_sent, sizeof(Pad)) == 0) {
+            return;
         }
 
         auto fbits = [](float f) -> uint32_t {
@@ -311,29 +405,30 @@ namespace Input {
                 0u,                              // jclass (unused by native)
                 1u,                              // productVersion (Shield)
                 0u,                              // 2nd Java arg, clobbered on entry
-                static_cast<uint32_t>(pad_state.A),
-                static_cast<uint32_t>(pad_state.B),
-                static_cast<uint32_t>(pad_state.X),
-                static_cast<uint32_t>(pad_state.Y),
-                static_cast<uint32_t>(pad_state.L1),
-                static_cast<uint32_t>(pad_state.L2),
-                static_cast<uint32_t>(pad_state.L3),
-                static_cast<uint32_t>(pad_state.R1),
-                static_cast<uint32_t>(pad_state.R2),
-                static_cast<uint32_t>(pad_state.R3),
-                static_cast<uint32_t>(pad_state.DpadUp),
-                static_cast<uint32_t>(pad_state.DpadDown),
-                static_cast<uint32_t>(pad_state.DpadLeft),
-                static_cast<uint32_t>(pad_state.DpadRight),
-                fbits(pad_state.AxisX),
-                fbits(pad_state.AxisY),
-                fbits(pad_state.AxisZ),
-                fbits(pad_state.AxisRZ),
-                static_cast<uint32_t>(pad_state.Start),
+                static_cast<uint32_t>(to_send.A),
+                static_cast<uint32_t>(to_send.B),
+                static_cast<uint32_t>(to_send.X),
+                static_cast<uint32_t>(to_send.Y),
+                static_cast<uint32_t>(to_send.L1),
+                static_cast<uint32_t>(to_send.L2),
+                static_cast<uint32_t>(to_send.L3),
+                static_cast<uint32_t>(to_send.R1),
+                static_cast<uint32_t>(to_send.R2),
+                static_cast<uint32_t>(to_send.R3),
+                static_cast<uint32_t>(to_send.DpadUp),
+                static_cast<uint32_t>(to_send.DpadDown),
+                static_cast<uint32_t>(to_send.DpadLeft),
+                static_cast<uint32_t>(to_send.DpadRight),
+                fbits(to_send.AxisX),
+                fbits(to_send.AxisY),
+                fbits(to_send.AxisZ),
+                fbits(to_send.AxisRZ),
+                static_cast<uint32_t>(to_send.Start),
             },
             /*verbose=*/false);
 
-        pad_last_sent = pad_state;
+        pad_last_sent = to_send;
         pad_ever_sent = true;
+        pad_pulse = {};   // consume: pulse-off will ship automatically next tick
     }
 }
