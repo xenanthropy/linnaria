@@ -108,6 +108,14 @@ namespace HLE::Math {
             std::memcpy(&cpu->Regs()[0], &result, 4);
         });
 
+        ROUTE_REGISTER(router, "atan2f", [](Dynarmic::A32::Jit* cpu) {
+            float y, x;
+            std::memcpy(&y, &cpu->Regs()[0], 4);
+            std::memcpy(&x, &cpu->Regs()[1], 4);
+            float result = std::atan2(y, x);
+            std::memcpy(&cpu->Regs()[0], &result, 4);
+        });
+
         ROUTE_REGISTER(router, "pow", [](Dynarmic::A32::Jit* cpu) {
             uint64_t x_bits = (static_cast<uint64_t>(cpu->Regs()[1]) << 32) | cpu->Regs()[0];
             uint64_t y_bits = (static_cast<uint64_t>(cpu->Regs()[3]) << 32) | cpu->Regs()[2];
