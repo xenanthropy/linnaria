@@ -126,12 +126,9 @@ public:
         std::cout << "\n[CRASH TRAP] Caught OOB reading " << funcName <<  " 0x"
                   << std::hex << vaddr << std::dec << "!" << std::endl;
         if (cpu) {
-            std::cout << "R0 (This): 0x" << std::hex << cpu->Regs()[0] << std::dec << std::endl;
-            std::cout << "R1: 0x" << std::hex << cpu->Regs()[1] << std::dec << std::endl;
-            std::cout << "R2: 0x" << std::hex << cpu->Regs()[2] << std::dec << std::endl;
-            std::cout << "R3: 0x" << std::hex << cpu->Regs()[3] << std::dec << std::endl;
+            for (int r = 0; r < 13; r++)
+                std::cout << "    R" << r << "=0x" << std::hex << cpu->Regs()[r] << std::dec << "\n";
             std::cout << "SP: 0x" << std::hex << cpu->Regs()[13] << std::dec << std::endl;
-            std::cout << "CPSR:0x" << std::hex << cpu->Cpsr() << std::dec << std::endl;
             std::cout << "LR (R14) : 0x" << std::hex << cpu->Regs()[14] << std::dec << std::endl;
             std::cout << "PC (R15) : 0x" << std::hex << cpu->Regs()[15] << std::dec << std::endl;
             std::cout << "host_tid=" << Watchpoint::TidString(std::this_thread::get_id()) << std::endl;
