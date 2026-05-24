@@ -448,6 +448,18 @@ namespace HLE::VFS {
             }
         });
 
+        ROUTE_REGISTER(router, "rename", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t old_ptr = cpu->Regs()[0];
+            uint32_t new_ptr = cpu->Regs()[1];
+            if (!old_ptr || !new_ptr) {
+                cpu->Regs()[0] = static_cast<uint32_t>(-1);
+                return;
+            }
+            const char* old_path = reinterpret_cast<const char*>(memory.GetHostPointer(old_ptr));
+            const char* new_path = reinterpret_cast<const char*>(memory.GetHostPointer(new_ptr));
+            cpu->Regs()[0] = static_cast<uint32_t>(std::rename(old_path, new_path));
+        });
+
         ROUTE_REGISTER(router, "writev", [&memory](Dynarmic::A32::Jit* cpu) {
             int fd = static_cast<int>(cpu->Regs()[0]);
             uint32_t iov_ptr = cpu->Regs()[1];
