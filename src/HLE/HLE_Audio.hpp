@@ -23,12 +23,25 @@ namespace HLE::Audio {
     inline SDL_AudioDeviceID device = 0;
     inline uint32_t bytes_per_second = 176400; // default 44.1kHz / 16-bit / stereo
 
-    // Returned from AudioTrack.getMinBufferSize(III)I. Bytes. The engine
-    // uses this as the byte-array size, so it's also the chunk size of
-    // every Write call. 16 KiB at 44.1kHz / 16-bit / stereo is ~93 ms --
-    // generous enough that occasional GC / scheduler stalls don't underrun.
-    inline int GetMinBufferSize() {
-        return 16384;
+    // Target latency budgets (the engine's mobile-era sample rates push these
+    // into hundreds of ms when we count in fixed bytes -- e.g. 22 kHz mono
+    // makes a 16 KiB chunk last 370 ms, which compounds into 2 s of delay
+    // when stacked behind PulseAudio's own buffering. Always derive byte
+    // counts from these via bytes_per_second.)
+    inline constexpr uint32_t CHUNK_MS         = 50;   // engine's per-write chunk
+    inline constexpr uint32_t QUEUE_LIMIT_MS   = 100;  // throttle threshold
+
+    // Returned from AudioTrack.getMinBufferSize(III)I. The engine uses this as
+    // the byte-array size and the per-write chunk, so it directly controls
+    // input latency. Computed from the engine's requested format so the time
+    // budget is consistent across sample rates.
+    inline int GetMinBufferSize(int sampleRate, int channels, int bits) {
+        int bps = sampleRate * channels * (bits / 8);
+        int bytes = static_cast<int>((static_cast<uint64_t>(bps) * CHUNK_MS) / 1000);
+        if (bytes < 1024) bytes = 1024; // floor: avoid silly-small chunks
+        // Round up to a multiple of 4 for cleanliness (frame size is at most 4)
+        bytes = (bytes + 3) & ~3;
+        return bytes;
     }
 
     inline void OpenDevice(int sampleRate, int channels, int bits) {
@@ -92,9 +105,12 @@ namespace HLE::Audio {
             return;
         }
 
-        // Throttle: block until SDL's queue has drained below ~4 buffers'
-        // worth. Mirrors AudioTrack.write blocking on a full hardware buffer.
-        const Uint32 max_queued = 4 * 16384;
+        // Throttle by TIME, not bytes -- at 22 kHz mono / 16-bit, the same
+        // 64 KiB byte threshold would correspond to ~1.5 s, on top of which
+        // PulseAudio's own buffers pile up to ~2 s of delay before sounds
+        // play. Cap our queue at QUEUE_LIMIT_MS so total latency stays in
+        // the ~150 ms range regardless of sample rate.
+        const Uint32 max_queued = (bps * QUEUE_LIMIT_MS) / 1000;
         while (SDL_GetQueuedAudioSize(dev) > max_queued) {
             SDL_Delay(2);
         }

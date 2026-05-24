@@ -222,7 +222,16 @@ public:
             std::string key = MethodKey(methodID);
 
             if (key == "getMinBufferSize(III)I") {
-                cpu->Regs()[0] = HLE::Audio::GetMinBufferSize();
+                // getMinBufferSize(int sampleRate, int channelConfig, int audioFormat)
+                // CallStaticIntMethodV: R0=env, R1=class, R2=methodID, R3=va_list.
+                uint32_t va = cpu->Regs()[3];
+                uint32_t sampleRate    = mem.Read32(va + 0);
+                uint32_t channelConfig = mem.Read32(va + 4);
+                uint32_t audioFormat   = mem.Read32(va + 8);
+                int channels = (channelConfig == 3) ? 2 : 1;
+                int bits     = (audioFormat == 2)   ? 16 : 8;
+                cpu->Regs()[0] = HLE::Audio::GetMinBufferSize(
+                    static_cast<int>(sampleRate), channels, bits);
                 return;
             }
             cpu->Regs()[0] = 0;
