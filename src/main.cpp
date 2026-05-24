@@ -561,8 +561,8 @@ int main(int argc, char** argv) {
                         // Frame is clean, input can be dispatched next loop
                         main_thread_clean = true;
 
+                        ++ud1_counter;
                         if constexpr (Config::Prints::heartbeat) {
-                            ++ud1_counter;
                             if (ud1_counter - last_ud1_report >= 60) {
                                 last_ud1_report = ud1_counter;
                                 std::lock_guard<std::mutex> lock(console_mutex);
