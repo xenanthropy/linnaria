@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
         SDL_Window* window = SDL_CreateWindow(
             "Linnaria", 
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
-            1280, 720, 
+            1920, 1080,
             SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN
         );
 
@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
         // signature: (JNIEnv*, jclass, jint w, jint h, jfloat cmW, jfloat cmH, jfloat diag)
         // Floats must be passed as raw 32-bit bitcasts
         uint32_t cmW, cmH, diag;
-        float f_cmW = 14.0f, f_cmH = 7.0f, f_diag = 6.0f;
+        float f_cmW = 14.0f, f_cmH = 7.0f, f_diag = 8.0f; // 6.0f
         
         // DEBUG: test bigger resolution when necessary (1920x1080 screen)
         //float f_cmW = 12.0f, f_cmH = 6.0f, f_diag = 14.0f;
@@ -337,9 +337,9 @@ int main(int argc, char** argv) {
 
         ExecuteGameFunction(cpu, memory, loader,
             "Java_com_codeglue_terraria_OctarineBridge_nativeOnResizeSurface",
-            { env_ptr, 0, 1280, 720, cmW, cmH, diag }
+            //{ env_ptr, 0, 1280, 720, cmW, cmH, diag }
             // DEBUG: test bigger resolution when necessary (1920x1080 screen)
-            //{ env_ptr, 0, 1920, 1080, cmW, cmH, diag }
+            { env_ptr, 0, 1920, 1080, cmW, cmH, diag }
         );
 
         // Lie to AndroidInterface::CheckMemoryInfo so extended worlds unlock.

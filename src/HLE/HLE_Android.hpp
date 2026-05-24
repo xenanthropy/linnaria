@@ -6,13 +6,36 @@
 #include "Config.hpp"
 #include <mutex>
 
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+
 static std::mutex asset_manager_lock;
 
 namespace HLE::Android {
 
-    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
+    // helper function for printing current time for logs
+    inline void PrintTime() {
+        using namespace std::chrono;
 
-        // TODO:
+        auto now = system_clock::now();
+        auto now_time = system_clock::to_time_t(now);
+
+        auto ms = duration_cast<milliseconds>(
+            now.time_since_epoch()
+        ) % 1000;
+
+        std::tm local_time = *std::localtime(&now_time);
+
+        std::cout
+            << std::put_time(&local_time, "%H:%M:%S")
+            << '.'
+            << std::setfill('0') << std::setw(3)
+            << ms.count();
+    }
+
+    inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
 
         ROUTE_REGISTER(router, "Emulator_Return_Trap", [](Dynarmic::A32::Jit* cpu) {
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined1); 
@@ -227,7 +250,13 @@ namespace HLE::Android {
                 }
                 if (!muted) {
                     std::lock_guard<std::mutex> lock(console_mutex);
-                    std::cout << "[Android Log] " << tag << ": " << output << std::endl;
+                    if constexpr (Config::Prints::androidLogTime) {
+                        std::cout << "[Android Log : ";
+                        PrintTime();
+                        std::cout << "] " << tag << ": " << output << "";
+                    } else {
+                        std::cout << "[Android Log] " << tag << ": " << output << "";
+                    }
                 }
             }
 

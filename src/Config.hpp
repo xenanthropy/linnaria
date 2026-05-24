@@ -71,6 +71,10 @@ namespace Config {
         // own diagnostics surface.
         inline constexpr bool androidLog = true;
 
+        // Adds the time to __android_log_print calls
+        // Helpful for benchmarking and etc.
+        inline constexpr bool androidLogTime = true;
+
         // Substring matched against the formatted Android log body when
         // androidLog is on. Lines containing any of these are NOT printed.
         // Defaults mute the per-touch chatter that floods during dragging.
