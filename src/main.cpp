@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
 
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
         // Initialize SDL2 Video
-        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
             std::cerr << "Failed to init SDL: " << SDL_GetError() << std::endl;
             return 1;
         }

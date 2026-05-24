@@ -3,11 +3,41 @@
 #include "ElfLoader.hpp"
 #include "SyscallRouter.hpp"
 #include "JNIFunctions.hpp"
+#include "HLE/HLE_Audio.hpp"
 #include <mutex>
+#include <map>
 
 class JNIEmulator {
 public:
     static constexpr uint32_t JNI_BASE = GuestMemory::CODE_BASE + 0x8000000; // 128MB offset
+
+    // Method-ID registry. GetMethodID/GetStaticMethodID returns a unique ID per
+    // (name, signature) pair; the *Method* dispatch handlers recover the pair
+    // and route to the right behavior (currently: AudioTrack methods). Names
+    // can collide across classes ("write" exists in lots of Java classes), so
+    // we key on name+signature, which is distinctive enough in practice.
+    struct MethodInfo { std::string name; std::string sig; };
+    static inline std::mutex method_mutex;
+    static inline std::map<uint32_t, MethodInfo> method_registry;
+    static inline uint32_t next_method_id = 0x10000;
+
+    static uint32_t RegisterMethod(const std::string& name, const std::string& sig) {
+        std::lock_guard<std::mutex> lock(method_mutex);
+        for (auto& [id, info] : method_registry) {
+            if (info.name == name && info.sig == sig) return id;
+        }
+        uint32_t id = next_method_id++;
+        method_registry[id] = { name, sig };
+        return id;
+    }
+
+    // Returns "<name><sig>" e.g. "write([BII)I". Empty if unknown.
+    static std::string MethodKey(uint32_t id) {
+        std::lock_guard<std::mutex> lock(method_mutex);
+        auto it = method_registry.find(id);
+        if (it == method_registry.end()) return "";
+        return it->second.name + it->second.sig;
+    }
 
     static uint32_t Install(GuestMemory& mem, ElfLoader& loader, SyscallRouter& router) {
         uint32_t env_ptr = JNI_BASE;
@@ -71,7 +101,23 @@ public:
         mem.Write32(table_ptr + (223 * 4), loader.GetThunk("JNI_ReleasePrimitiveArrayCritical"));
 
         ROUTE_REGISTER(router, "JNI_FindClass", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0x1337; });
-        ROUTE_REGISTER(router, "JNI_GetMethodID", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0x7331; });
+
+        // Reads a NUL-terminated string from guest memory byte-by-byte.
+        // Used by GetMethodID / GetStaticMethodID to capture the method name
+        // and signature for later dispatch.
+        auto read_guest_string = [&mem](uint32_t ptr) -> std::string {
+            std::string s;
+            if (!ptr) return s;
+            uint32_t p = ptr;
+            while (char c = static_cast<char>(mem.Read8(p++))) s += c;
+            return s;
+        };
+
+        ROUTE_REGISTER(router, "JNI_GetMethodID", [&mem, read_guest_string](Dynarmic::A32::Jit* cpu) {
+            std::string name = read_guest_string(cpu->Regs()[2]);
+            std::string sig  = read_guest_string(cpu->Regs()[3]);
+            cpu->Regs()[0] = RegisterMethod(name, sig);
+        });
 
         ROUTE_REGISTER(router, "JNI_GetStringUTFChars", [&mem](Dynarmic::A32::Jit* cpu) {
             uint32_t jstr_ptr = cpu->Regs()[1];
@@ -104,8 +150,10 @@ public:
             cpu->Regs()[0] = 0; 
         });
 
-        ROUTE_REGISTER(router, "JNI_GetStaticMethodID", [](Dynarmic::A32::Jit* cpu) {
-            cpu->Regs()[0] = 0x7332; // Dummy non-zero method ID
+        ROUTE_REGISTER(router, "JNI_GetStaticMethodID", [&mem, read_guest_string](Dynarmic::A32::Jit* cpu) {
+            std::string name = read_guest_string(cpu->Regs()[2]);
+            std::string sig  = read_guest_string(cpu->Regs()[3]);
+            cpu->Regs()[0] = RegisterMethod(name, sig);
         });
 
         ROUTE_REGISTER(router, "JNI_CallStaticVoidMethodV", [](Dynarmic::A32::Jit* cpu) {
@@ -139,10 +187,78 @@ public:
 
         ROUTE_REGISTER(router, "JNI_PushLocalFrame",[](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0; }); // JNI_OK
         ROUTE_REGISTER(router, "JNI_NewGlobalRef", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = cpu->Regs()[1]; }); // Return the same ref
-        ROUTE_REGISTER(router, "JNI_NewObjectV", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0x88888888; }); // Dummy Object
-        ROUTE_REGISTER(router, "JNI_CallNonvirtualVoidMethodV",[](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0; });
-        ROUTE_REGISTER(router, "JNI_CallNonvirtualIntMethodV",[](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0; });
-        ROUTE_REGISTER(router, "JNI_CallStaticIntMethodV", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = 0; }); // Stub to 0
+
+        // NewObjectV(env, jclass, jmethodID, va_list) -- 4 fixed args, no
+        // variadic at this ABI level (variadic was flattened by the C++
+        // wrapper NewObject before it called us). So R0=env, R1=class,
+        // R2=methodID, R3=va_list (a guest pointer into the wrapper's
+        // arg-spill area; variadic args are packed at 4-byte boundaries).
+        ROUTE_REGISTER(router, "JNI_NewObjectV", [&mem](Dynarmic::A32::Jit* cpu) {
+            uint32_t methodID = cpu->Regs()[2];
+            std::string key = MethodKey(methodID);
+
+            if (key == "<init>(IIIIII)V") {
+                // AudioTrack(streamType, sampleRate, channelConfig,
+                //            audioFormat, bufferSize, mode)
+                uint32_t va = cpu->Regs()[3];
+                uint32_t streamType    = mem.Read32(va +  0);
+                uint32_t sampleRate    = mem.Read32(va +  4);
+                uint32_t channelConfig = mem.Read32(va +  8);
+                uint32_t audioFormat   = mem.Read32(va + 12);
+                uint32_t bufferSize    = mem.Read32(va + 16);
+                uint32_t mode          = mem.Read32(va + 20);
+                (void)streamType; (void)bufferSize; (void)mode;
+
+                int channels = (channelConfig == 3) ? 2 : 1;  // STEREO=3, MONO=2
+                int bits     = (audioFormat == 2)   ? 16 : 8; // PCM_16BIT=2, PCM_8BIT=3
+                HLE::Audio::OpenDevice(static_cast<int>(sampleRate), channels, bits);
+            }
+
+            cpu->Regs()[0] = 0x88888888; // dummy jobject; engine treats as opaque handle
+        });
+
+        ROUTE_REGISTER(router, "JNI_CallStaticIntMethodV", [&mem](Dynarmic::A32::Jit* cpu) {
+            uint32_t methodID = cpu->Regs()[2];
+            std::string key = MethodKey(methodID);
+
+            if (key == "getMinBufferSize(III)I") {
+                cpu->Regs()[0] = HLE::Audio::GetMinBufferSize();
+                return;
+            }
+            cpu->Regs()[0] = 0;
+        });
+
+        // CallNonvirtualVoidMethodV(env, obj, jclass, jmethodID, va_list).
+        // R0=env, R1=obj, R2=class, R3=methodID, [SP+0]=va_list.
+        ROUTE_REGISTER(router, "JNI_CallNonvirtualVoidMethodV", [&mem](Dynarmic::A32::Jit* cpu) {
+            uint32_t methodID = cpu->Regs()[3];
+            std::string key = MethodKey(methodID);
+
+            if      (key == "play()V")    HLE::Audio::Play();
+            else if (key == "stop()V")    HLE::Audio::Stop();
+            else if (key == "release()V") HLE::Audio::Close();
+        });
+
+        ROUTE_REGISTER(router, "JNI_CallNonvirtualIntMethodV", [&mem](Dynarmic::A32::Jit* cpu) {
+            uint32_t methodID = cpu->Regs()[3];
+            std::string key = MethodKey(methodID);
+
+            if (key == "write([BII)I") {
+                // AudioTrack.write(byte[] audioData, int offsetInBytes, int sizeInBytes)
+                uint32_t va = mem.Read32(cpu->Regs()[13]);
+                uint32_t byteArray = mem.Read32(va +  0);
+                int32_t  offset    = static_cast<int32_t>(mem.Read32(va +  4));
+                int32_t  length    = static_cast<int32_t>(mem.Read32(va +  8));
+
+                if (byteArray && length > 0) {
+                    const uint8_t* src = reinterpret_cast<const uint8_t*>(mem.GetHostPointer(byteArray)) + offset;
+                    HLE::Audio::Write(src, length);
+                }
+                cpu->Regs()[0] = static_cast<uint32_t>(length); // bytes written
+                return;
+            }
+            cpu->Regs()[0] = 0;
+        });
 
         return env_ptr;
     }
