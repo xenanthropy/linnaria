@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string>
 #include <exception>
+#include <cstdio>
 
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
@@ -419,6 +420,16 @@ int main(int argc, char** argv) {
         uint32_t last_tick = SDL_GetTicks();
         uint32_t last_swap = SDL_GetTicks();
 
+        // FPS / tick-rate window title. Both numbers are interesting separately:
+        // tick = how often nativeOnUpdate completes (game-logic frame rate);
+        // render = how often we actually SDL_GL_SwapWindow. When tick lags
+        // render, the game itself is slow; when render lags tick, GL/host is
+        // the bottleneck.
+        uint32_t fps_swap_counter = 0;
+        uint64_t fps_last_ud1 = 0;
+        uint32_t fps_last_report = SDL_GetTicks();
+        const uint32_t fps_report_interval_ms = 500;
+
         // True when main_thread is between native calls (last halt was
         // UserDefined1). Used to gate Input::DrainPending so we don't
         // re-use the stack while a guest function is paused on it.
@@ -604,6 +615,22 @@ int main(int argc, char** argv) {
                 Pacing::frame_dirty.store(false, std::memory_order_relaxed);
                 last_swap = now;
                 swapped = true;
+                ++fps_swap_counter;
+            }
+
+            // Update window title with measured rates every fps_report_interval_ms.
+            if (now - fps_last_report >= fps_report_interval_ms) {
+                uint32_t elapsed_ms = now - fps_last_report;
+                uint32_t render_fps = (fps_swap_counter * 1000u) / elapsed_ms;
+                uint32_t tick_fps   = static_cast<uint32_t>(((ud1_counter - fps_last_ud1) * 1000ULL) / elapsed_ms);
+                char title[128];
+                std::snprintf(title, sizeof(title),
+                    "Linnaria  |  tick: %u fps  |  render: %u fps",
+                    tick_fps, render_fps);
+                SDL_SetWindowTitle(window, title);
+                fps_swap_counter = 0;
+                fps_last_ud1 = ud1_counter;
+                fps_last_report = now;
             }
 
             // --- 4. Idle yield: don't pin a core when nothing's due ---
