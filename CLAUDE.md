@@ -9,7 +9,7 @@ Linnaria is a Linux launcher/runtime for the Android APK build of Terraria 1.2.1
 ## Build / Run
 
 ```bash
-git submodule update --init --recursive          # Dynarmic lives at third-party/dynarmic
+git submodule update --init --recursive          # not needed if you cloned with --recursive; Dynarmic lives at third-party/dynarmic
 cmake -B build -S .                              # add -DCMAKE_EXPORT_COMPILE_COMMANDS=YES for clangd
 cmake --build build -j$(nproc)
 build/linnaria lib/libTerraria.so                # user-supplied; APK assets must be extracted to ./assets, ./data, ./obb
@@ -42,7 +42,7 @@ The `page_table` array is handed to Dynarmic's fastmem path; `GetHostPointer` is
 
 **`SyscallRouter`** (`src/SyscallRouter.hpp`) maps symbol name → `std::function<void(Jit*)>`. Always register with the `ROUTE_REGISTER(router, "name", lambda)` macro — it captures `__FILE__`/`__LINE__` so `DumpSyscallMap("syscalls.txt")` (written on boot) doubles as an HLE coverage map. Unregistered calls log `[UNIMPLEMENTED]` and return 0 in R0; add the stub to the appropriate `HLE::*` module rather than `main.cpp`.
 
-**HLE modules** (`src/HLE/HLE_*.hpp`) each expose `RegisterAll(router, memory, ...)` and group thunks by domain: `OS`, `Memory` (malloc/free over `GuestMemory::AllocateHeap`), `Strings`, `VFS` (routes through `HostAssetManager` for assets), `Math`, `Stdlib`, `Time`, `Threading`, `Network`, `Zlib`, `OpenGL` (forwards GLES2 calls to host via glad), `Android`. `AndroidEnvironment::RegisterAll` (`src/AndroidEnvironment.hpp`) is the single wire-up site.
+**HLE modules** (`src/HLE/HLE_*.hpp`) each expose `RegisterAll(router, memory, ...)` and group thunks by domain: `OS`, `Memory` (malloc/free over `GuestMemory::AllocateHeap`), `Strings`, `VFS` (routes through `HostAssetManager` for assets), `Math`, `Stdlib`, `Time`, `Threading`, `Network`, `Zlib`, `OpenGL` (forwards GLES2 calls to host via glad), `Android`, `Audio` (SDL2 `SDL_QueueAudio` mixer; queue-based with best-effort device open). `AndroidEnvironment::RegisterAll` (`src/AndroidEnvironment.hpp`) is the single wire-up site for all of these **except `HLE::Audio`**, which is called directly from the JNI `AudioTrack` handlers in `src/JNIEmulator.hpp` (`play()V`, `write(...)`, `release()V`, etc.) rather than through `SyscallRouter`.
 
 **JNI** (`src/JNIEmulator.hpp`, `src/JNIFunctions.hpp`) constructs a fake `JNIEnv*` at `JNI_BASE = CODE_BASE + 0x8000000`: every JNI table slot is filled with a thunk that logs "unimplemented", then the slots the game actually uses are overwritten (`FindClass`=6, `GetMethodID`=33, `RegisterNatives`=215, `GetJavaVM`=219, etc.). A fake `JavaVM` lives 0x1000 bytes later with `AttachCurrentThread`/`GetEnv` wired up.
 
@@ -56,7 +56,17 @@ The `page_table` array is handed to Dynarmic's fastmem path; `GetHostPointer` is
 - `frame_dirty` — set by `glClear` / `glDrawElements` in `HLE_OpenGL`; cleared by the main loop on swap. Swap is gated on this so logic-only ticks don't ping-pong a stale back buffer.
 - `input_enabled` — flipped true by `HLE_Android`'s `__android_log_print` handler when it sees the Octarine log line `"TerrariaInitializer::Run() DONE"` (= main menu fully constructed). Until then, `Input::HandleSDLEvent` drops SDL events at the gate so we don't dispatch into half-built game state. A second one-shot trigger on `"Initialized achievement system"` bumps `game_tick_hz` to 60 once boot is past asset extraction.
 
-**`Input`** (`src/Input.hpp`) — translates SDL events to Octarine's JNI input. Single-finger touch (left mouse → `nativeTouchEvent` with action 0/1/2 = DOWN/UP/MOVE); keyboard via SDL keysym → AOSP `KeyEvent.KEYCODE_*` table → `nativeKeyEvent`. Special case: `keyCode == 66` (Enter) is rewritten to `(action=0, unicode='\n', keyCode=0)` because that's the magic 3-tuple Octarine's `onEditorAction` submits text with; see the in-game text-entry path. Events are queued in `std::deque`s; consecutive MOVEs coalesce to the latest position. `DrainPending` dispatches **at most one** touch + one key per main-loop iteration, gated on `main_thread_clean` — so `nativeOnUpdate` always drains the game's internal touch queue between additions. Dispatching a burst, or dispatching when `main_thread_clean` is false, corrupts the deque (see git log for the painful debugging session).
+**`Input`** (`src/Input.hpp`) — translates SDL events to Octarine's JNI input. Every SDL keydown drives **two parallel paths**: raw keys flow to `nativeKeyEvent`, and a subset is also synthesized into a gamepad snapshot sent via `nativeGamePadUpdate`. The game consumes both.
+
+*Touch:* single-finger only (left mouse → `nativeTouchEvent` with action 0/1/2 = DOWN/UP/MOVE). Events are queued in `std::deque`s; consecutive MOVEs coalesce to the latest position so a fast drag doesn't burst the game's fixed-size internal touch queue. `DrainPending` dispatches **at most one** touch + one key per main-loop iteration, gated on `main_thread_clean` — so `nativeOnUpdate` always drains the game's internal touch queue between additions. Dispatching a burst, or dispatching when `main_thread_clean` is false, corrupts the deque (see git log for the painful debugging session).
+
+*Keyboard → `nativeKeyEvent`:* SDL keysym → AOSP `KeyEvent.KEYCODE_*` table (`SDLKeyToAndroid`). Special case: `keyCode == 66` (Enter) is rewritten to `(action=0, unicode='\n', keyCode=0)` because that's the magic 3-tuple Octarine's `onEditorAction` submits text with; see the in-game text-entry path.
+
+*Keyboard → gamepad (`nativeGamePadUpdate`):* `ApplyPadKey` mirrors the Java `ShieldController → Gamepad → AndroidInterface::fjAddGamePad` pipeline. The snapshot has two semantic regimes:
+- **Axes (held):** WASD → `AxisX/Y` ∈ {−1, 0, +1}, recomputed from per-key booleans so opposing keys held simultaneously resolve via "latest press wins" (`last_horiz_press`, `last_vert_press`) and don't lose state when one is released. `AxisY` is **inverted vs. screen-down convention** (W sends +1) to match the Java path that ships `AxisY * −1`.
+- **Buttons (pulse):** E/F/Tab/Q/R/Esc → B/X/Y/L1/R1/Start fire for **one snapshot** then clear. The engine re-reads the stored Gamepad on every internal tick and treats any non-zero button as "freshly pressed", so held semantics would auto-repeat (menu flicker, hotbar auto-cycle). Space (Jump → A) is the exception: held, so the engine can extend jump height for the full press duration. The `g_is_typing` global gates E → B so opening chat doesn't fire an action.
+
+`SendGamepadUpdate` runs **once per game tick** (not per outer-loop iteration) and must be gated on `main_thread_clean` for the same stack-reuse reason as `DrainPending`. Two sends in the same inter-tick window would let the pulse-off snapshot overwrite the pulse-on before the engine processed either. L2/R2 trigger fields are a known Java-vs-native type mismatch on the mobile port (typed `int` in Java, read as `float` natively → effectively zero); the snapshot matches Java's bit pattern.
 
 ## Boot sequence in `main.cpp`
 
