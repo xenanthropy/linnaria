@@ -1,0 +1,124 @@
+From: Linnaria
+Subject: [PATCH] Add fast supervisor call support for A32 frontend
+
+Adds an opt-in fast path for SVC dispatch on the A32 frontend, paralleling
+the A64 patch by hippoz. When UserCallbacks::GetSupervisorFastCall returns
+a SupervisorFastCall for a given SVC immediate, the JIT inlines a direct
+call to the registered function pointer:
+  - ARM r[0..N-1] are loaded straight into x64 SysV ABI param regs.
+  - Function is called via BlockOfCode::CallFunction (no vtable, no
+    std::function trampoline, no map lookup).
+  - Return value (Integer32 or Integer64) is written back to ARM r0
+    (and r1 for 64-bit).
+When the callback returns std::nullopt, the original CallSVC path runs
+unchanged. The existing MXCSR-switch and cycle-counting wrappers in
+EmitA32CallSupervisor are preserved on both paths.
+
+A32 uses softfp by default (Bionic), so floats ride in r-regs as
+uint32_t bit-patterns -- no separate float-param path is needed,
+unlike the A64 version of this patch.
+
+---
+ src/dynarmic/backend/x64/a32_emit_x64.cpp | 49 ++++++++++++++++++++++-
+ src/dynarmic/interface/A32/config.h       | 22 ++++++++++
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/backend/x64/a32_emit_x64.cpp
+--- a/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -22,6 +22,7 @@
+ #include "dynarmic/backend/x64/stack_layout.h"
+ #include "dynarmic/common/variant_util.h"
+ #include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/frontend/A32/a32_types.h"
++#include "dynarmic/interface/A32/config.h"
+ #include "dynarmic/interface/A32/coprocessor.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/microinstruction.h"
+@@ -747,8 +748,52 @@ void A32EmitX64::EmitA32CallSupervisor(A32EmitContext& ctx, IR::Inst* inst) {
+     }
+
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+-    ctx.reg_alloc.HostCall(nullptr, {}, args[0]);
+-    Devirtualize<&A32::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code);
++    ASSERT(args[0].IsImmediate());
++    const u32 imm = args[0].GetImmediateU32();
++
++    auto fast_call = conf.callbacks->GetSupervisorFastCall(imm);
++    if (fast_call) {
++        ASSERT(fast_call->integer_params <= ABI_PARAM_COUNT);
++
++        ctx.reg_alloc.HostCall(nullptr);
++
++        for (std::uint32_t i = 0; i < fast_call->integer_params; i++) {
++            // ARM register r[i] -> x64 ABI param (32-bit load,
++            // auto-zero-extended to 64 by x86_64 semantics).
++            const auto addr = dword[r15 + offsetof(A32JitState, Reg) + sizeof(u32) * static_cast<size_t>(i)];
++            code.mov(code.ABI_PARAMS[i].cvt32(), addr);
++        }
++
++        code.CallFunction(fast_call->function);
++
++        using ReturnType = Dynarmic::A32::UserCallbacks::SupervisorFastCall::ReturnType;
++        switch (fast_call->return_type) {
++        case ReturnType::Integer32: {
++            const auto r0 = dword[r15 + offsetof(A32JitState, Reg) + sizeof(u32) * 0];
++            code.mov(r0, code.ABI_RETURN.cvt32());
++        } break;
++
++        case ReturnType::Integer64: {
++            // AAPCS: low half in r0, high half in r1.
++            const auto r0 = dword[r15 + offsetof(A32JitState, Reg) + sizeof(u32) * 0];
++            const auto r1 = dword[r15 + offsetof(A32JitState, Reg) + sizeof(u32) * 1];
++            code.mov(r0, code.ABI_RETURN.cvt32());
++            code.shr(code.ABI_RETURN, 32);
++            code.mov(r1, code.ABI_RETURN.cvt32());
++        } break;
++
++        case ReturnType::Void:
++            break;
++        }
++
++        ctx.reg_alloc.EndOfAllocScope();
++    } else {
++        ctx.reg_alloc.HostCall(nullptr, {}, args[0]);
++        Devirtualize<&A32::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code);
++    }
+
+     if (conf.enable_cycle_counting) {
+         Devirtualize<&A32::UserCallbacks::GetTicksRemaining>(conf.callbacks).EmitCall(code);
+diff --git a/src/dynarmic/interface/A32/config.h b/src/dynarmic/interface/A32/config.h
+--- a/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/interface/A32/config.h
+@@ -58,8 +58,30 @@ enum class Exception {
+
+ /// These function pointers may be inserted into compiled code.
+ struct UserCallbacks : public TranslateCallbacks {
++    struct SupervisorFastCall final {
++        enum class ReturnType : std::uint32_t {
++            Void = 0,
++            Integer32,
++            Integer64,
++        };
++
++        explicit SupervisorFastCall(void (*function)(),
++                                    std::uint32_t integer_params,
++                                    ReturnType return_type)
++            : function(function)
++            , integer_params(integer_params)
++            , return_type(return_type) {}
++
++        void (*function)();
++        std::uint32_t integer_params;
++        ReturnType return_type;
++    };
++
+     virtual ~UserCallbacks() = default;
+
++    /// Query for a fast-path SVC handler. Called at JIT compile time.
++    /// Return std::nullopt to fall through to CallSVC (the default).
++    virtual std::optional<SupervisorFastCall> GetSupervisorFastCall(std::uint32_t swi) { (void)swi; return std::nullopt; }
++
+     // All reads through this callback are 4-byte aligned.
+     // Memory must be interpreted as little endian.
+     std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override { return MemoryRead32(vaddr); }
