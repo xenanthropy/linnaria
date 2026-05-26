@@ -89,10 +89,6 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
             cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
             break;
         }
-        // If the main thread yields, clear it and keep going
-        if (halt_reason == Dynarmic::HaltReason::UserDefined2) {
-            cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
-        }
 
         if (halt_reason == Dynarmic::HaltReason::UserDefined3) {
             cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
@@ -181,6 +177,7 @@ int main(int argc, char** argv) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetSwapInterval(0);
 
         // Create the Window
         SDL_Window* window = SDL_CreateWindow(
@@ -240,8 +237,16 @@ int main(int argc, char** argv) {
         // arithmetic against the page table for a major perf win.
         config.fastmem_pointer = Config::Performance::fastmem
             ? reinterpret_cast<uintptr_t>(memory.fastmem_base) : 0;
-        config.recompile_on_fastmem_failure = true;
+        config.recompile_on_fastmem_failure = false;
+        config.recompile_on_exclusive_fastmem_failure = false;
+        config.enable_cycle_counting = false;
+        config.wall_clock_cntpct = true;
+        config.fastmem_exclusive_access = true;
         config.arch_version = Dynarmic::A32::ArchVersion::v7;
+
+        config.unsafe_optimizations = true;
+
+        config.code_cache_size = 1024 * 1024 * 1024;
 
         config.global_monitor = &monitor;
         config.processor_id = 0; // Main Thread is Core 0
@@ -570,17 +575,6 @@ int main(int argc, char** argv) {
                             }
                         }
                         break; // Exit inner loop
-                    }
-                    else if (halt == Dynarmic::HaltReason::UserDefined2) {
-                        cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
-
-                        // The game called a yielding function (e.g., usleep).
-                        // Save the exact paused state to resume next frame.
-                        for (int r = 0; r < 16; r++) main_thread.regs[r] = cpu.Regs()[r];
-                        main_thread.cpsr = cpu.Cpsr();
-
-                        main_thread_clean = false; // Still active/suspended
-                        break; // Exit inner loop to let SDL poll and host sleep
                     }
                     else if (halt == Dynarmic::HaltReason::UserDefined3) {
                         cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);

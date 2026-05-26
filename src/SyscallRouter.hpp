@@ -31,20 +31,12 @@ public:
         if (slash_pos != std::string::npos) {
             filename = filename.substr(slash_pos + 1);
         }
-
         handlers[name] = {handler, filename, line};
     }
 
     void Invoke(const std::string& name, Dynarmic::A32::Jit* cpu) {
         auto it = handlers.find(name);
         if (it != handlers.end()) {
-            /* IGNORE: extra optional debug prints
-                std::cout << "[TID: " << std::this_thread::get_id() << "] "
-                          << "Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
-                Optional: You can print the file it came from here too!
-                std::cout << "[Router] Executing: " << name << " (from " << it->second.file_path << ")" << std::endl;
-                OPTIONAL: Uncomment to see successful calls
-            */
             if constexpr (Config::Prints::functionCalls) {
                 bool muted = false;
                 for (auto m : Config::Prints::functionCallMutes) {
@@ -81,6 +73,11 @@ public:
                 << info.line_number << "\n";
         }
         std::cout << "[Router] Saved syscall map to " << filepath << std::endl;
+    }
+
+    SyscallHandler GetHandler(const std::string& name) {
+        auto it = handlers.find(name);
+        return it != handlers.end() ? it->second.handler : nullptr;
     }
 
 private:

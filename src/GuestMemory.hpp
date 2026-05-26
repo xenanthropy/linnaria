@@ -10,6 +10,7 @@
 #include <iostream>
 #include <sys/mman.h>
 #include <queue>
+#include <set>
 
 #include <cstring>
 #include <map>
@@ -42,6 +43,7 @@ public:
     };
 
     std::map<uint32_t, uint32_t>   free_blocks;  // Address -> Size
+    std::set<std::pair<uint32_t, uint32_t>> free_by_size; // Size -> Address (Fast Lookup)
     std::map<uint32_t, AllocInfo>  allocations;  // Address -> AllocInfo (sorted for range lookup)
 
     GuestMemory() {
@@ -83,17 +85,15 @@ public:
         // Add the Kernel Helper Page to the Dynarmic page table
         page_table[0xFFFF0] = (uint8_t*)kuser_ptr;
 
-        // Inject ARM machine code for __kuser_cmpxchg at 0xFFFF0FC0
-        // Signature: int cmpxchg(int oldval (R0), int newval (R1), int* ptr (R2))
         uint32_t* cmpxchg = reinterpret_cast<uint32_t*>((uint8_t*)kuser_ptr + 0x0FC0);
-        cmpxchg[0] = 0xe5923000; // ldr r3, [r2]      (Load current value)
-        cmpxchg[1] = 0xe1530000; // cmp r3, r0        (Compare with expected oldval)
-        cmpxchg[2] = 0x1a000002; // bne 2f            (If not equal, skip to fail)
-        cmpxchg[3] = 0xe5821000; // str r1, [r2]      (Store newval)
-        cmpxchg[4] = 0xe3a00000; // mov r0, #0        (Success: return 0)
-        cmpxchg[5] = 0xe12fff1e; // bx lr             (Return)
-        cmpxchg[6] = 0xe3a00001; // mov r0, #1        (Fail: return 1)
-        cmpxchg[7] = 0xe12fff1e; // bx lr             (Return)
+        cmpxchg[0] = 0xe5923000; // ldr r3, [r2]
+        cmpxchg[1] = 0xe1530000; // cmp r3, r0
+        cmpxchg[2] = 0x1a000002; // bne 2f
+        cmpxchg[3] = 0xe5821000; // str r1, [r2]
+        cmpxchg[4] = 0xe3a00000; // mov r0, #0
+        cmpxchg[5] = 0xe12fff1e; // bx lr
+        cmpxchg[6] = 0xe3a00001; // mov r0, #1
+        cmpxchg[7] = 0xe12fff1e; // bx lr
 
         // Inject __kuser_memory_barrier at 0xFFFF0FA0
         uint32_t* dmb = reinterpret_cast<uint32_t*>((uint8_t*)kuser_ptr + 0x0FA0);
@@ -150,13 +150,6 @@ public:
 
                 std::exit(1);
             }
-            /*
-            std::lock_guard<std::mutex> lock(console_mutex);
-            std::cout << "[Memory] WARNING: Out of bounds access at 0x" << std::hex << vaddr << std::dec << std::endl;
-            //std::cerr << "[Memory] WARNING: Out of bounds access at 0x" << std::hex << vaddr << std::dec << std::endl;
-            dummy_memory = 0;
-            return reinterpret_cast<uint8_t*>(&dummy_memory);
-            */
         }
         return fastmem_base + vaddr;
     }
@@ -207,23 +200,26 @@ public:
 
             // Search for a free block that fits (First-Fit)
             bool from_free_list = false;
-            for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
-                if (it->second >= size) {
-                    addr = it->first;
-                    uint32_t block_size = it->second;
-                    free_blocks.erase(it);
 
-                    // Split block if there's enough leftover space
-                    if (block_size > size + 8) {
-                        free_blocks[addr + size] = block_size - size;
-                        alloc_size = size;
-                    } else {
-                        alloc_size = block_size;
-                    }
-                    allocations[addr] = {alloc_size, caller_pc, std::this_thread::get_id()};
-                    from_free_list = true;
-                    break;
+            auto it = free_by_size.lower_bound({size, 0}); // Find smallest block >= size
+            if (it != free_by_size.end()) {
+                uint32_t block_size = it->first;
+                addr = it->second;
+
+                // Remove from both trackers
+                free_by_size.erase(it);
+                free_blocks.erase(addr);
+
+                // Split block if there's enough leftover space
+                if (block_size > size + 8) {
+                    free_blocks[addr + size] = block_size - size;
+                    free_by_size.insert({block_size - size, addr + size});
+                    alloc_size = size;
+                } else {
+                    alloc_size = block_size;
                 }
+                allocations[addr] = {alloc_size, caller_pc, std::this_thread::get_id()};
+                from_free_list = true;
             }
 
             if (!from_free_list) {
@@ -300,27 +296,39 @@ public:
             uint32_t size = it->second.size;
             allocations.erase(it);
 
-            // Diagnostic UAF probe: skip returning the block to the free
-            // list. The address is retired permanently, so a stale pointer
-            // can never alias a future allocation.
             if (Config::Performance::disableHeapReuse) return;
 
+            // Insert into both trackers
             free_blocks[ptr] = size;
+            free_by_size.insert({size, ptr});
 
             // Coalesce adjacent free blocks to prevent fragmentation
             auto current = free_blocks.find(ptr);
 
             auto next = std::next(current); // Merge forward
             if (next != free_blocks.end() && current->first + current->second == next->first) {
+                // Erase old records from the size index
+                free_by_size.erase({current->second, current->first});
+                free_by_size.erase({next->second, next->first});
+                
+                // Merge
                 current->second += next->second;
                 free_blocks.erase(next);
+                
+                // Insert merged record
+                free_by_size.insert({current->second, current->first});
             }
 
             if (current != free_blocks.begin()) { // Merge backward
                 auto prev = std::prev(current);
                 if (prev->first + prev->second == current->first) {
+                    free_by_size.erase({prev->second, prev->first});
+                    free_by_size.erase({current->second, current->first});
+                    
                     prev->second += current->second;
                     free_blocks.erase(current);
+                    
+                    free_by_size.insert({prev->second, prev->first});
                 }
             }
         }

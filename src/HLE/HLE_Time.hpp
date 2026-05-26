@@ -51,10 +51,21 @@ namespace HLE::Time {
             cpu->Regs()[0] = static_cast<uint32_t>(current_time);
         });
 
-        ROUTE_REGISTER(router, "nanosleep", [](Dynarmic::A32::Jit* cpu) {
-            cpu->Regs()[0] = 0;
-            // Force Dynarmic to break out of its execution loop
-            cpu->HaltExecution(Dynarmic::HaltReason::UserDefined2); 
+        ROUTE_REGISTER(router, "nanosleep", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t req_ptr = cpu->Regs()[0];
+            if (req_ptr) {
+                int32_t tv_sec  = static_cast<int32_t>(memory.Read32(req_ptr));
+                int32_t tv_nsec = static_cast<int32_t>(memory.Read32(req_ptr + 4));
+        
+                if (tv_sec == 0 && tv_nsec == 0) {
+                    std::this_thread::yield(); // It's just a 0-wait yield
+                } else {
+                    std::this_thread::sleep_for(std::chrono::seconds(tv_sec) + std::chrono::nanoseconds(tv_nsec));
+                }
+            } else {
+                std::this_thread::yield();
+            }
+            cpu->Regs()[0] = 0; // Return success
         });
 
         ROUTE_REGISTER(router, "gmtime_r", [&memory](Dynarmic::A32::Jit* cpu) {

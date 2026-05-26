@@ -8,7 +8,7 @@
 // fully eliminates disabled print sites -- zero runtime cost when off.
 //
 // Always-on regardless of these flags:
-//   - Error-class diagnostics ([ZLIB] ERROR, [Watchpoint] CROSS-THREAD,
+//   - Error-class diagnostics ([ZLIB] ERROR,
 //     OOB traps, [UNIMPLEMENTED] syscall calls).
 
 namespace Config {
@@ -33,6 +33,13 @@ namespace Config {
         // corruption/crash disappears with this on, it's a UAF. Leaks
         // memory, so only for short diagnostic sessions.
         inline constexpr bool disableHeapReuse = false;
+    }
+
+    namespace Debug {
+        // If a guest write hits a watched range owned by a different host thread,
+        // dump full CPU state + the allocation map and exit. This is the moment
+        // we want to catch the heap-vs-stack aliasing bug.
+        inline constexpr bool crossThreadWriteCheck = false;
     }
 
     namespace Prints {
@@ -66,6 +73,9 @@ namespace Config {
         // Magic Bytes" lines for each asset access.
         inline constexpr bool assetManager = false;
 
+        // HLE_Strings strcmp extra info printing
+        inline constexpr bool strcmp = false;
+
         // HLE_Android "[Android Log] <tag>: <body>" stream from the game's
         // __android_log_print calls. Default on -- this is where Octarine's
         // own diagnostics surface.
@@ -81,6 +91,9 @@ namespace Config {
         inline constexpr std::string_view androidLogMutes[] = {
             "RespondToTouchTrack",
             "TapCount:",
+            "board event",
+            "key event",
+            "wchar",
         };
 
         // Verbose mutex / CV trace, ungated by the functionCalls toggle.

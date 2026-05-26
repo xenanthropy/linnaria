@@ -1,8 +1,10 @@
 #pragma once
+#include "Config.hpp"
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
 #include "SyscallRouter.hpp"
 #include "JNIFunctions.hpp"
+#include "Input.hpp"
 #include "HLE/HLE_Audio.hpp"
 #include <mutex>
 #include <map>
@@ -76,7 +78,7 @@ public:
                     std::lock_guard<std::mutex> lock(console_mutex);
                     std::cout << "[JNI] WARNING: Unimplemented JNI function: " << "[" << i << "] " << name << std::endl;
                 }
-                cpu->Regs()[0] = 0; 
+                cpu->Regs()[0] = 0;
             });
         }
 
@@ -84,13 +86,13 @@ public:
         mem.Write32(table_ptr + (6 * 4), loader.GetThunk("JNI_FindClass"));
         mem.Write32(table_ptr + (19 * 4), loader.GetThunk("JNI_PushLocalFrame"));
         mem.Write32(table_ptr + (21 * 4), loader.GetThunk("JNI_NewGlobalRef"));
+        mem.Write32(table_ptr + (23 * 4),  loader.GetThunk("JNI_DeleteLocalRef"));
         mem.Write32(table_ptr + (29 * 4), loader.GetThunk("JNI_NewObjectV"));
         mem.Write32(table_ptr + (33 * 4), loader.GetThunk("JNI_GetMethodID"));
         mem.Write32(table_ptr + (80 * 4), loader.GetThunk("JNI_CallNonvirtualIntMethodV"));
         mem.Write32(table_ptr + (92 * 4), loader.GetThunk("JNI_CallNonvirtualVoidMethodV"));
         mem.Write32(table_ptr + (118 * 4), loader.GetThunk("JNI_CallStaticBooleanMethodV"));
         mem.Write32(table_ptr + (130 * 4), loader.GetThunk("JNI_CallStaticIntMethodV"));
-        mem.Write32(table_ptr + (23 * 4),  loader.GetThunk("JNI_DeleteLocalRef"));
         mem.Write32(table_ptr + (167 * 4), loader.GetThunk("JNI_NewStringUTF"));
         mem.Write32(table_ptr + (169 * 4), loader.GetThunk("JNI_GetStringUTFChars"));
         mem.Write32(table_ptr + (170 * 4), loader.GetThunk("JNI_ReleaseStringUTFChars"));
@@ -156,8 +158,33 @@ public:
             cpu->Regs()[0] = RegisterMethod(name, sig);
         });
 
-        ROUTE_REGISTER(router, "JNI_CallStaticVoidMethodV", [](Dynarmic::A32::Jit* cpu) {
-            // No-op: the Java method doesn't exist on the host anyway
+        ROUTE_REGISTER(router, "JNI_CallStaticVoidMethodV", [&mem](Dynarmic::A32::Jit* cpu) {
+            uint32_t methodID = cpu->Regs()[2];
+            std::string key = MethodKey(methodID);
+
+            if (Config::Prints::functionCalls) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cout << "[JNI] CallStaticVoidMethodV: " << key << "\n";
+            }
+            if (key == "KeyboardShow(Ljava/lang/String;)V") {
+                uint32_t va = cpu->Regs()[3];
+                uint32_t jstr_ptr = mem.Read32(va);
+                std::string current_text;
+                if (jstr_ptr) {
+                    current_text = reinterpret_cast<const char*>(mem.GetHostPointer(jstr_ptr));
+                }
+
+                // Only print if the string actually has something so we don't spam the console
+                if (!current_text.empty() && (Config::Prints::functionCalls)) {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Keyboard] Syncing text state: '" << current_text << "'\n";
+                }
+
+                g_is_typing = true;
+            }
+            else if (key == "KeyboardHide()V" || key == "KeyboardCancel()V") {
+                g_is_typing = false;
+            }
         });
 
         // Boolean-returning static calls (e.g. OctarineBridge::GoogleSignedIn())

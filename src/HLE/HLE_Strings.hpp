@@ -9,7 +9,6 @@ namespace HLE::Strings {
 
         ROUTE_REGISTER(router, "strlen", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t ptr = cpu->Regs()[0];
-            bool is_xml = (0x55b9dbc0 != 0 && ptr >= 0x55b9dbc0 && ptr < (0x55b9dbc0 + 0x223b));
 
             uint32_t len = 0;
             // Safely compute length (limit to 1MB to avoid hangs)
@@ -20,19 +19,44 @@ namespace HLE::Strings {
             cpu->Regs()[0] = len;
         });
 
+        ROUTE_REGISTER(router, "strcpy", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t dest_ptr = cpu->Regs()[0];
+            uint32_t src_ptr  = cpu->Regs()[1];
+            
+            if (dest_ptr && src_ptr) {
+                char* dest = reinterpret_cast<char*>(memory.GetHostPointer(dest_ptr));
+                const char* src = reinterpret_cast<const char*>(memory.GetHostPointer(src_ptr));
+                std::strcpy(dest, src);
+            }
+            
+            // strcpy always returns the destination pointer
+            cpu->Regs()[0] = dest_ptr;
+        });
+
+        ROUTE_REGISTER(router, "strcat", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t dest_ptr = cpu->Regs()[0];
+            uint32_t src_ptr  = cpu->Regs()[1];
+            
+            if (dest_ptr && src_ptr) {
+                char* dest = reinterpret_cast<char*>(memory.GetHostPointer(dest_ptr));
+                const char* src = reinterpret_cast<const char*>(memory.GetHostPointer(src_ptr));
+                std::strcat(dest, src);
+            }
+            
+            cpu->Regs()[0] = dest_ptr;
+        });
+
         ROUTE_REGISTER(router, "strcmp", [&memory](Dynarmic::A32::Jit* cpu) {
             uint32_t s1 = cpu->Regs()[0];
             uint32_t s2 = cpu->Regs()[1];
             const char* str1 = reinterpret_cast<const char*>(memory.GetHostPointer(s1));
             const char* str2 = reinterpret_cast<const char*>(memory.GetHostPointer(s2));
 
-            /* IGNORE: Debug print
-            {
+            if (Config::Prints::strcmp) {
                 std::lock_guard<std::mutex> lock(console_mutex);
                 std::cout << "[Router] strcmp: comparing '" << (str1 ? str1 : "(null)") 
                           << "' with '" << (str2 ? str2 : "(null)") << "'" << std::endl;
             }
-            */
 
             cpu->Regs()[0] = std::strcmp(str1, str2);
         });

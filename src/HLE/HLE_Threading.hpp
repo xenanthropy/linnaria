@@ -17,13 +17,29 @@
 #include <chrono>
 #include <memory>
 #include <unordered_map>
+#include <shared_mutex>
 
 namespace HLE::Threading {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor) {
 
-        static std::mutex host_mutex_lock;
+        static std::shared_mutex host_mutex_lock;
         static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> host_mutexes;
+
+        auto get_mutex = [](uint32_t mutex_ptr) -> std::shared_ptr<std::recursive_mutex> {
+            {
+                // Readers can run in parallel
+                std::shared_lock<std::shared_mutex> lock(host_mutex_lock);
+                auto it = host_mutexes.find(mutex_ptr);
+                if (it != host_mutexes.end()) return it->second;
+            }
+    
+            // Only lock uniquely if we actually need to create a new one
+            std::unique_lock<std::shared_mutex> lock(host_mutex_lock);
+            auto& slot = host_mutexes[mutex_ptr];
+            if (!slot) slot = std::make_shared<std::recursive_mutex>();
+            return slot;
+        };
 
         // Condition variables live in a parallel map. condition_variable_any
         // (not the regular one) so it pairs with the recursive_mutex above.
@@ -131,8 +147,16 @@ namespace HLE::Threading {
                 // perf default.
                 config.fastmem_pointer = Config::Performance::fastmem
                     ? reinterpret_cast<uintptr_t>(memory.fastmem_base) : 0;
-                config.recompile_on_fastmem_failure = true;
+                config.recompile_on_fastmem_failure = false;
+                config.recompile_on_exclusive_fastmem_failure = false;
+                config.enable_cycle_counting = false;
+                config.wall_clock_cntpct = true;  // hack?
+                config.fastmem_exclusive_access = true;
+
                 config.arch_version = Dynarmic::A32::ArchVersion::v7;
+
+                config.unsafe_optimizations = true;
+                config.code_cache_size = 1024 * 1024 * 1024;
 
                 // Share the global monitor, give thread a unique ID and its own CP15/TLS
                 config.global_monitor = &monitor;
@@ -169,11 +193,6 @@ namespace HLE::Threading {
                         thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined1);
                     }
 
-                    if (halt == Dynarmic::HaltReason::UserDefined2) {
-                        thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined2);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
-
                     if (halt == Dynarmic::HaltReason::UserDefined3) {
                         thread_cpu.ClearHalt(Dynarmic::HaltReason::UserDefined3);
                         if (once_saved_state.valid) {
@@ -201,7 +220,7 @@ namespace HLE::Threading {
                 std::cout << "[Threading] Background thread exited gracefully." << std::endl;
 
             }).detach(); // Detach allows it to run freely alongside the main threads
-            
+
             cpu->Regs()[0] = 0; // Success
         });
 
@@ -259,61 +278,30 @@ namespace HLE::Threading {
             cpu->Regs()[0] = 0;
         });
 
-        ROUTE_REGISTER(router, "pthread_mutex_lock",[](Dynarmic::A32::Jit* cpu) {
+        ROUTE_REGISTER(router, "pthread_mutex_lock", [get_mutex](Dynarmic::A32::Jit* cpu) {
             uint32_t mutex_ptr = cpu->Regs()[0];
-            std::shared_ptr<std::recursive_mutex> m;
-            {
-                std::lock_guard<std::mutex> lock(host_mutex_lock);
-                if (!host_mutexes[mutex_ptr]) host_mutexes[mutex_ptr] = std::make_shared<std::recursive_mutex>();
-                m = host_mutexes[mutex_ptr];
-            }
-            if constexpr (Config::Prints::mutexTrace) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] mutex_lock   waiting 0x" << std::hex << mutex_ptr << std::dec << "\n";
-            }
-            m->lock(); // Block natively
-            if constexpr (Config::Prints::mutexTrace) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] mutex_lock   ACQUIRED 0x" << std::hex << mutex_ptr << std::dec << "\n";
-            }
+            auto m = get_mutex(mutex_ptr);
+            m->lock(); 
             cpu->Regs()[0] = 0;
         });
 
-        ROUTE_REGISTER(router, "pthread_mutex_trylock",[](Dynarmic::A32::Jit* cpu) {
+        ROUTE_REGISTER(router, "pthread_mutex_trylock", [get_mutex](Dynarmic::A32::Jit* cpu) {
             uint32_t mutex_ptr = cpu->Regs()[0];
-            std::shared_ptr<std::recursive_mutex> m;
-            {
-                std::lock_guard<std::mutex> lock(host_mutex_lock);
-                auto& slot = host_mutexes[mutex_ptr];
-                if (!slot) slot = std::make_shared<std::recursive_mutex>();
-                m = slot;
-            }
+            auto m = get_mutex(mutex_ptr);
             bool got = m->try_lock();
-            if constexpr (Config::Prints::mutexTrace) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] mutex_trylock " << (got ? "OK " : "EBUSY ") << "0x" << std::hex << mutex_ptr << std::dec << "\n";
-            }
             cpu->Regs()[0] = got ? 0 : 16 /* EBUSY */;
         });
 
-        ROUTE_REGISTER(router, "pthread_mutex_unlock",[](Dynarmic::A32::Jit* cpu) {
+        ROUTE_REGISTER(router, "pthread_mutex_unlock", [get_mutex](Dynarmic::A32::Jit* cpu) {
             uint32_t mutex_ptr = cpu->Regs()[0];
-            std::shared_ptr<std::recursive_mutex> m;
-            {
-                std::lock_guard<std::mutex> lock(host_mutex_lock);
-                m = host_mutexes[mutex_ptr];
-            }
-            if (m) m->unlock();
-            if constexpr (Config::Prints::mutexTrace) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] mutex_unlock          0x" << std::hex << mutex_ptr << std::dec << "\n";
-            }
+            auto m = get_mutex(mutex_ptr);
+            m->unlock();
             cpu->Regs()[0] = 0;
         });
 
-        ROUTE_REGISTER(router, "pthread_mutex_destroy",[](Dynarmic::A32::Jit* cpu) {
+        ROUTE_REGISTER(router, "pthread_mutex_destroy", [](Dynarmic::A32::Jit* cpu) {
             uint32_t mutex_ptr = cpu->Regs()[0];
-            std::lock_guard<std::mutex> lock(host_mutex_lock);
+            std::unique_lock<std::shared_mutex> lock(host_mutex_lock); // Must unique_lock to erase
             host_mutexes.erase(mutex_ptr);
             cpu->Regs()[0] = 0;
         });
@@ -330,13 +318,6 @@ namespace HLE::Threading {
             std::lock_guard<std::mutex> lock(host_cv_lock);
             auto& slot = host_cvs[cv_ptr];
             if (!slot) slot = std::make_shared<std::condition_variable_any>();
-            return slot;
-        };
-
-        auto get_mutex = [](uint32_t mutex_ptr) -> std::shared_ptr<std::recursive_mutex> {
-            std::lock_guard<std::mutex> lock(host_mutex_lock);
-            auto& slot = host_mutexes[mutex_ptr];
-            if (!slot) slot = std::make_shared<std::recursive_mutex>();
             return slot;
         };
 
@@ -395,28 +376,39 @@ namespace HLE::Threading {
 
             auto cv = get_cv(cv_ptr);
             auto m  = get_mutex(mutex_ptr);
+            std::cv_status status = std::cv_status::no_timeout;
 
-            std::chrono::time_point<std::chrono::system_clock> deadline;
             if (abstime_ptr) {
                 int64_t tv_sec  = static_cast<int32_t>(memory.Read32(abstime_ptr));
                 int64_t tv_nsec = static_cast<int32_t>(memory.Read32(abstime_ptr + 4));
-                deadline = std::chrono::system_clock::time_point{}
-                         + std::chrono::seconds(tv_sec)
-                         + std::chrono::nanoseconds(tv_nsec);
+
+                std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
+
+                // If time is less than ~1 billion, it's CLOCK_MONOTONIC (time since boot).
+                if (tv_sec < 1000000000LL) {
+                    // Anchor the guest's monotonic time to the host's steady_clock.
+                    static auto emu_start = std::chrono::steady_clock::now();
+                    auto deadline = emu_start + std::chrono::seconds(tv_sec) + std::chrono::nanoseconds(tv_nsec);
+                    status = cv->wait_until(lock, deadline);
+                } else {
+                    // It's CLOCK_REALTIME (Unix Epoch)
+                    auto deadline = std::chrono::system_clock::time_point{} 
+                                  + std::chrono::seconds(tv_sec) 
+                                  + std::chrono::nanoseconds(tv_nsec);
+                    status = cv->wait_until(lock, deadline);
+                }
+                lock.release();
             } else {
-                deadline = std::chrono::system_clock::now();
+                std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
+                cv->wait(lock);
+                lock.release();
             }
 
             if constexpr (Config::Prints::mutexTrace) {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] cond_tw      enter    cv=0x" << std::hex << cv_ptr << " mutex=0x" << mutex_ptr << std::dec << "\n";
-            }
-            std::unique_lock<std::recursive_mutex> lock(*m, std::adopt_lock);
-            auto status = cv->wait_until(lock, deadline);
-            lock.release();
-            if constexpr (Config::Prints::mutexTrace) {
                 std::lock_guard<std::mutex> lock2(console_mutex);
-                std::cout << "[Thread " << active_thread_id << "] cond_tw      " << (status == std::cv_status::timeout ? "TIMEOUT" : "SIGNAL ") << "  cv=0x" << std::hex << cv_ptr << std::dec << "\n";
+                std::cout << "[Thread " << active_thread_id << "] cond_tw      " 
+                          << (status == std::cv_status::timeout ? "TIMEOUT" : "SIGNAL ") 
+                          << "  cv=0x" << std::hex << cv_ptr << std::dec << "\n";
             }
 
             cpu->Regs()[0] = (status == std::cv_status::timeout) ? 110 /* ETIMEDOUT */ : 0;

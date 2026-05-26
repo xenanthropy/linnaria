@@ -22,7 +22,7 @@ public:
         return *mem.GetHostPointer(vaddr);
     }
     void MemoryWrite8(uint32_t vaddr, uint8_t value) override {
-        CheckCrossThreadWrite(vaddr, 1, value);
+         if (Config::Debug::crossThreadWriteCheck) CheckCrossThreadWrite(vaddr, 1, value);
         *mem.GetHostPointer(vaddr) = value;
     }
 
@@ -31,7 +31,7 @@ public:
         return MemoryRead8(vaddr) | (uint16_t(MemoryRead8(vaddr + 1)) << 8);
     }
     void MemoryWrite16(uint32_t vaddr, uint16_t value) override {
-        CheckCrossThreadWrite(vaddr, 2, value);
+        if (Config::Debug::crossThreadWriteCheck) CheckCrossThreadWrite(vaddr, 2, value);
         MemoryWrite8(vaddr,     value & 0xFF);
         MemoryWrite8(vaddr + 1, (value >> 8) & 0xFF);
     }
@@ -41,7 +41,7 @@ public:
         return mem.Read32(vaddr);
     }
     void MemoryWrite32(uint32_t vaddr, uint32_t value)  override {
-        CheckCrossThreadWrite(vaddr, 4, value);
+        if (Config::Debug::crossThreadWriteCheck) CheckCrossThreadWrite(vaddr, 4, value);
         if constexpr (Config::Prints::stackWriteTrap) {
             // Catch a stray write into the top of the main stack -- where
             // nativeTouchEvent's saved registers live. The corrupting value
@@ -69,7 +69,7 @@ public:
         return uint64_t(MemoryRead32(vaddr)) | (uint64_t(MemoryRead32(vaddr + 4)) << 32);
     }
     void MemoryWrite64(uint32_t vaddr, uint64_t value) override {
-        CheckCrossThreadWrite(vaddr, 8, value);
+        if (Config::Debug::crossThreadWriteCheck) CheckCrossThreadWrite(vaddr, 8, value);
         MemoryWrite32(vaddr,     uint32_t(value));
         MemoryWrite32(vaddr + 4, uint32_t(value >> 32));
     }
@@ -140,15 +140,58 @@ public:
         std::exit(1);
     }
 
-    void CallSVC(uint32_t swi) override {
-        // --- pthread_once_done detection ---
+    inline void CallSVC(uint32_t swi) override {
         if (swi == 0xFFFFFF) {
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined3);
             return;
         }
 
+        struct CachedSyscall {
+            SyscallHandler handler;
+            std::string name;
+        };
+
+        // Static cache maps the integer SWI directly to the lambda AND the string name
+        static std::unordered_map<uint32_t, CachedSyscall> fast_dispatch;
+
+        auto it = fast_dispatch.find(swi);
+        if (it != fast_dispatch.end()) {
+            it->second.handler(cpu);
+
+            if constexpr (Config::Prints::functionCalls) {
+                bool muted = false;
+                for (const auto& m : Config::Prints::functionCallMutes) {
+                    if (it->second.name.find(m) != std::string::npos) { muted = true; break; }
+                }
+                if (!muted) {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Thread " << active_thread_id << "] Executing: " << it->second.name << "\n";
+                }
+            }
+            return;
+        }
+
+        // First time seeing this SWI: do the slow string lookup and cache it
         std::string name = loader.GetSymbolName(swi);
-        router.Invoke(name, cpu);
+        SyscallHandler handler = router.GetHandler(name);
+
+        if (handler) {
+            fast_dispatch[swi] = {handler, name};
+            handler(cpu);
+
+            if constexpr (Config::Prints::functionCalls) {
+                bool muted = false;
+                for (const auto& m : Config::Prints::functionCallMutes) {
+                    if (name.find(m) != std::string::npos) { muted = true; break; }
+                }
+                if (!muted) {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "[Thread " << active_thread_id << "] Executing: " << name << "\n";
+                }
+            }
+        } else {
+            router.Invoke(name, cpu); // Fallback to trigger the UNIMPLEMENTED warning
+        }
     }
 
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception exception) override {
@@ -163,7 +206,7 @@ public:
     }
 
     void AddTicks(uint64_t ticks) override {}
-    uint64_t GetTicksRemaining() override { return 100000; }
+    uint64_t GetTicksRemaining() override { return 10000000; }
 
     Dynarmic::A32::Jit* cpu = nullptr;
 

@@ -17,6 +17,8 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
                          const std::string& func_name, const std::vector<uint32_t>& args,
                          bool verbose = true);
 
+inline bool g_is_typing = false;
+
 namespace Input {
 
     // Octarine touch action codes (see OctarineView.onTouchEvent in the Java
@@ -150,7 +152,7 @@ namespace Input {
                 pad_state.A = down ? 1 : 0;
                 return true;
             // Action / menu (one-frame pulses on key-down only)
-            case SDLK_e:      if (down) pad_pulse.B     = 1; return true;
+            case SDLK_e:      if (down && !g_is_typing) pad_pulse.B     = 1; return true;
             case SDLK_f:      if (down) pad_pulse.X     = 1; return true;
             case SDLK_TAB:    if (down) pad_pulse.Y     = 1; return true;
             case SDLK_q:      if (down) pad_pulse.L1    = 1; return true;

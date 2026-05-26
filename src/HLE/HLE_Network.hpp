@@ -11,9 +11,6 @@ namespace HLE::Network {
 
     inline void RegisterAll(SyscallRouter& router, GuestMemory& memory) {
 
-        // TODO: listen, accept, connect, send, recv, recvfrom, shutdown, getsockopt, poll
-        //       select, inet_ntoa, getaddrinfo, freeaddrinfo, gai_strerror, getnameinfo, if_nametoindex
-
         ROUTE_REGISTER(router, "socket", [](Dynarmic::A32::Jit* cpu) {
             int domain   = static_cast<int>(cpu->Regs()[0]);
             int type     = static_cast<int>(cpu->Regs()[1]);
@@ -34,12 +31,16 @@ namespace HLE::Network {
         });
 
         ROUTE_REGISTER(router, "sendto", [&memory](Dynarmic::A32::Jit* cpu) {
-            int sockfd          = static_cast<int>(cpu->Regs()[0]);
+            int sockfd           = static_cast<int>(cpu->Regs()[0]);
             uint32_t buf_ptr     = cpu->Regs()[1];
             uint32_t len         = cpu->Regs()[2];
             int flags            = static_cast<int>(cpu->Regs()[3]);
-            uint32_t dest_ptr    = cpu->Regs()[4];
-            uint32_t addrlen     = cpu->Regs()[5];
+            
+            // Arguments 5 and 6 are passed on the stack
+            uint32_t sp          = cpu->Regs()[13];
+            uint32_t dest_ptr    = memory.Read32(sp);
+            uint32_t addrlen     = memory.Read32(sp + 4);
+
             if (!buf_ptr || !dest_ptr) { cpu->Regs()[0] = -1; return; }
 
             const void* buf  = memory.GetHostPointer(buf_ptr);
@@ -47,6 +48,42 @@ namespace HLE::Network {
 
             ssize_t ret = ::sendto(sockfd, buf, len, flags,
                                    static_cast<const struct sockaddr*>(dest), addrlen);
+            cpu->Regs()[0] = static_cast<uint32_t>(ret);
+        });
+
+        ROUTE_REGISTER(router, "recvfrom", [&memory](Dynarmic::A32::Jit* cpu) {
+            int sockfd           = static_cast<int>(cpu->Regs()[0]);
+            uint32_t buf_ptr     = cpu->Regs()[1];
+            uint32_t len         = cpu->Regs()[2];
+            int flags            = static_cast<int>(cpu->Regs()[3]);
+
+            // Arguments 5 and 6 are passed on the stack
+            uint32_t sp          = cpu->Regs()[13];
+            uint32_t addr_ptr    = memory.Read32(sp);
+            uint32_t addrlen_ptr = memory.Read32(sp + 4);
+
+            if (!buf_ptr) { 
+                cpu->Regs()[0] = -1; 
+                return; 
+            }
+
+            void* buf = memory.GetHostPointer(buf_ptr);
+            struct sockaddr* src_addr = nullptr;
+            socklen_t addrlen = 0;
+
+            // recvfrom allows passing NULL if the caller doesn't care about the sender's address
+            if (addr_ptr && addrlen_ptr) {
+                src_addr = reinterpret_cast<struct sockaddr*>(memory.GetHostPointer(addr_ptr));
+                addrlen = memory.Read32(addrlen_ptr);
+            }
+
+            ssize_t ret = ::recvfrom(sockfd, buf, len, flags, src_addr, (addr_ptr && addrlen_ptr) ? &addrlen : nullptr);
+
+            // If it succeeded and the guest asked for the sender address, write the new size back
+            if (ret >= 0 && addr_ptr && addrlen_ptr) {
+                memory.Write32(addrlen_ptr, static_cast<uint32_t>(addrlen));
+            }
+
             cpu->Regs()[0] = static_cast<uint32_t>(ret);
         });
 
@@ -65,11 +102,15 @@ namespace HLE::Network {
         });
 
         ROUTE_REGISTER(router, "setsockopt", [&memory](Dynarmic::A32::Jit* cpu) {
-            int sockfd    = static_cast<int>(cpu->Regs()[0]);
-            int level     = static_cast<int>(cpu->Regs()[1]);
-            int optname   = static_cast<int>(cpu->Regs()[2]);
+            int sockfd          = static_cast<int>(cpu->Regs()[0]);
+            int level           = static_cast<int>(cpu->Regs()[1]);
+            int optname         = static_cast<int>(cpu->Regs()[2]);
             uint32_t optval_ptr = cpu->Regs()[3];
-            uint32_t optlen     = cpu->Regs()[4];
+            
+            // Argument 5 is passed on the stack
+            uint32_t sp         = cpu->Regs()[13];
+            uint32_t optlen     = memory.Read32(sp);
+            
             if (!optval_ptr) { cpu->Regs()[0] = -1; return; }
 
             const void* optval = memory.GetHostPointer(optval_ptr);
@@ -128,6 +169,28 @@ namespace HLE::Network {
             cpu->Regs()[0] = ::gethostname(name, len);
         });
 
+        ROUTE_REGISTER(router, "inet_ntoa", [&memory](Dynarmic::A32::Jit* cpu) {
+            uint32_t in_addr_val = cpu->Regs()[0]; // Passed by value
+            
+            struct in_addr addr;
+            addr.s_addr = in_addr_val;
+            
+            char* str = ::inet_ntoa(addr);
+
+            // Emulate the static buffer behavior of inet_ntoa
+            static uint32_t guest_buf_ptr = 0;
+            if (guest_buf_ptr == 0) {
+                guest_buf_ptr = memory.AllocateHeap(16); // "255.255.255.255\0" max
+            }
+            
+            if (str) {
+                std::strncpy(reinterpret_cast<char*>(memory.GetHostPointer(guest_buf_ptr)), str, 16);
+            } else {
+                memory.Write8(guest_buf_ptr, 0);
+            }
+            
+            cpu->Regs()[0] = guest_buf_ptr;
+        });
 
     }
 }
