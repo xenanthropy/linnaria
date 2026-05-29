@@ -1,4 +1,5 @@
 #pragma once
+#include "Config.hpp"
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
 #include <cstring>
@@ -39,7 +40,7 @@ namespace HLE::Memory {
             uint32_t n    = cpu->Regs()[2];
 
             if (n > 0) {
-                memory.CheckBoundedWrite(dest, n, "memcpy", cpu->Regs()[14]);
+                if (Config::Debug::checkBoundedWrite) memory.CheckBoundedWrite(dest, n, "memcpy", cpu->Regs()[14]);
                 std::memcpy(memory.GetHostPointer(dest), memory.GetHostPointer(src), n);
             }
 
@@ -51,7 +52,9 @@ namespace HLE::Memory {
             uint8_t val = static_cast<uint8_t>(cpu->Regs()[1]);
             uint32_t count = cpu->Regs()[2];
 
-            if (count > 0) memory.CheckBoundedWrite(dest, count, "memset", cpu->Regs()[14]);
+            if (count > 0 && Config::Debug::checkBoundedWrite) {
+                memory.CheckBoundedWrite(dest, count, "memset", cpu->Regs()[14]);
+            }
 
             for (uint32_t i = 0; i < count; i++) {
                 memory.Write8(dest + i, val);
@@ -64,7 +67,9 @@ namespace HLE::Memory {
             uint32_t src = cpu->Regs()[1];
             uint32_t count = cpu->Regs()[2];
 
-            if (count > 0) memory.CheckBoundedWrite(dest, count, "memmove", cpu->Regs()[14]);
+            if (count > 0 && Config::Debug::checkBoundedWrite) {
+                memory.CheckBoundedWrite(dest, count, "memmove", cpu->Regs()[14]);
+            }
 
             std::memmove(memory.GetHostPointer(dest), memory.GetHostPointer(src), count);
 

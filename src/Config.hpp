@@ -40,6 +40,11 @@ namespace Config {
         // dump full CPU state + the allocation map and exit. This is the moment
         // we want to catch the heap-vs-stack aliasing bug.
         inline constexpr bool crossThreadWriteCheck = false;
+
+        // Bounds-check a bulk write of `n` bytes to `dest`. Fatal-on-fail per
+        // the user's "instrument fatal" preference.
+        // Very expensive, don't turn on unless needed for debugging.
+        inline constexpr bool checkBoundedWrite = false;
     }
 
     namespace Prints {
