@@ -1,4 +1,5 @@
 #pragma once
+#include "EmuCallbacks.hpp"
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
@@ -17,6 +18,9 @@
 #include "HLE/HLE_OpenGL.hpp"
 #include "HLE/HLE_Android.hpp"
 
+// .text shims
+#include "HLE/HLE_SoftFloat.hpp"
+
 struct EmuThread {
     std::array<uint32_t, 16> regs;
     uint32_t cpsr;
@@ -26,7 +30,7 @@ struct EmuThread {
 class AndroidEnvironment {
 
 public:
-    static void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor) {
+    static void RegisterAll(SyscallRouter& router, GuestMemory& memory, ElfLoader& loader, Dynarmic::ExclusiveMonitor& monitor, EmuCallbacks& callback) {
         
         HLE::OS::RegisterAll(router, memory, loader);
         HLE::Memory::RegisterAll(router, memory);
@@ -41,5 +45,8 @@ public:
         HLE::OpenGL::RegisterAll(router, memory);
         HLE::Android::RegisterAll(router, memory);
 
+        // Also register .text patch shims
+        HLE::SoftFloat::RegisterAll(memory, callback);
     }
+
 };

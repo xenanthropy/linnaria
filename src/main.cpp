@@ -1,3 +1,5 @@
+#include <cmath>
+#include <cstdint>
 #include <ios>
 #include <iostream>
 #include <mutex>
@@ -29,6 +31,81 @@
 
 thread_local Dynarmic::A32::Jit* active_cpu = nullptr;
 thread_local uint32_t active_thread_id = 0;
+
+void PatchGame(GuestMemory& memory) {
+        // Thumb mode: movs r0, #0; bx lr;
+        // Writes 0x2000 to the first halfword, and 0x4770 to the second.
+        uint32_t thumb_ret_false = 0x47702000;
+
+        if (Config::GameSettings::Patches::patchTouchscreenJoystick) {
+            // 1. Make the joystick invisible
+            // OnScreenJoystick::IsVisible
+            memory.Write32(memory.CODE_BASE + 0x001424BC, thumb_ret_false);
+
+            // 2. Prevent the UI from registering a touch so you can click the game world
+            // OnScreenJoystick::IsInJoystickZone
+            memory.Write32(memory.CODE_BASE + 0x00142470, thumb_ret_false);
+
+            // 3. Stop the touch input manager from prioritizing the joystick
+            // TouchInput::ShouldOnScreenJoystickBlockInput
+            memory.Write32(memory.CODE_BASE + 0x003AE940, thumb_ret_false);
+        }
+
+        if (Config::GameSettings::Patches::patchControllerGuide) {
+            // 4. Hide the Controller Guide (Bottom Button Bar) visually
+            // ControllerGuideState::Draw
+            memory.Write32(memory.CODE_BASE + 0x00103660, thumb_ret_false);
+
+            // 5. Tell the engine logic that the Controller Guide is gone
+            // ControllerGuideState::IsVisible
+            memory.Write32(memory.CODE_BASE + 0x00103BAC, thumb_ret_false);
+        }
+
+        if (Config::GameSettings::Patches::patchMagnifyingWhileMining) {
+            // Disable Magnifying Glass Visuals
+            // 1. Disable Magnifying Glass border Rendering
+            // UI::DrawMagnifyBorder
+            memory.Write32(memory.CODE_BASE + 0x00331500, thumb_ret_false);
+
+            // 2. Prevent Magnifier flag from setting during empty holds
+            // UI::DrawMagnify (subroutine)
+            memory.Write32(memory.CODE_BASE + 0x00338D88, 0x22004651);
+
+            // 3. Kill Magnifier Background Rendering
+            // Overwrites: BL WorldView::DrawBg
+            memory.Write32(memory.CODE_BASE + 0x00339230, 0xBF00BF00);
+
+            // 4. Kill Magnifier Tile Rendering
+            // Overwrites: BL WorldView::DrawWorld(int)
+            memory.Write32(memory.CODE_BASE + 0x00339238, 0xBF00BF00);
+        }
+
+        if (Config::GameSettings::Patches::patchAutoJump) {
+            // Disable Auto-Jump
+            memory.Write32(memory.CODE_BASE + 0x00272FB8, thumb_ret_false); // Player::CheckAutoJump
+        }
+
+        if (Config::GameSettings::Patches::patchMineDelay) {
+            // Eradicate 1.0s Mining/Building Delay (Forces immediate Continuous Use)
+            // UI::OnMagnifyTimerTick
+            // Overwrites: CMP R0, #0; BEQ loc_32E2B2
+            // With:       CMP R0, #0; NOP
+            memory.Write32(memory.CODE_BASE + 0x0032E312, 0xBF002800);
+        }
+
+        if (Config::GameSettings::Patches::patchControllerReticle) {
+            // UI::DrawCursor
+            memory.Write32(memory.CODE_BASE + 0x00335FD4, thumb_ret_false);
+        }
+
+        if (Config::GameSettings::Patches::patchAutoDoorOpening) {
+            // WorldGen::OpenDoors
+            memory.Write32(memory.CODE_BASE + 0x003697F0, thumb_ret_false);
+        }
+
+        // thunk Platform::QuitGame call to exit game properly
+        memory.Write32(memory.CODE_BASE + 0x00406784, 0xBF00DFFF);
+}
 
 void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader& loader,
                          const std::string& func_name, const std::vector<uint32_t>& args,
@@ -179,11 +256,19 @@ int main(int argc, char** argv) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         SDL_GL_SetSwapInterval(0);
 
+        int windowWidth = Config::GameSettings::Upscale::upscaling ?
+                          Config::GameSettings::Upscale::upscaleWidth :
+                          Config::GameSettings::Resolution::nativeX;
+
+        int windowHeight = Config::GameSettings::Upscale::upscaling ?
+                           Config::GameSettings::Upscale::upscaleHeight :
+                           Config::GameSettings::Resolution::nativeY;
+
         // Create the Window
         SDL_Window* window = SDL_CreateWindow(
             "Linnaria", 
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
-            1920, 1080,
+            windowWidth, windowHeight,
             SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN
         );
 
@@ -199,7 +284,7 @@ int main(int argc, char** argv) {
             exit(1);
         }
 
-        glClearColor(0.0f, 1.0f, 0.4f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         SDL_GL_SwapWindow(window);
 
@@ -210,22 +295,25 @@ int main(int argc, char** argv) {
         ElfLoader loader(memory);
         if (!loader.Load(argv[1])) return 1;
 
+        // patch game in memory to enable/disable features
+        PatchGame(memory);
+
         // Initialize our clean Syscall Router
         SyscallRouter router;
 
         // --- Setup Global Monitor BEFORE AndroidEnvironment setup ---
         Dynarmic::ExclusiveMonitor monitor(256); // Support up to 256 hardware threads!
-        
-        // --- Register environment calls ---
-        AndroidEnvironment::RegisterAll(router, memory, loader, monitor);
-
-        // save all registered functions to file
-        router.DumpSyscallMap("syscalls.txt");
 
         // 3. Configure Dynarmic CPU
         EmuCallbacks callbacks(memory, loader, router);
         Dynarmic::A32::UserConfig config;
         config.callbacks = &callbacks;
+
+        // --- Register environment calls ---
+        AndroidEnvironment::RegisterAll(router, memory, loader, monitor, callbacks);
+
+        // save all registered functions to file
+        router.DumpSyscallMap("syscalls.txt");
 
         // Give Dynarmic BOTH memory paths to prevent Xbyak fallback crashes
         config.page_table = &memory.page_table;
@@ -242,9 +330,15 @@ int main(int argc, char** argv) {
         config.enable_cycle_counting = false;
         config.wall_clock_cntpct = true;
         config.fastmem_exclusive_access = true;
-        config.arch_version = Dynarmic::A32::ArchVersion::v7;
+        config.arch_version = Dynarmic::A32::ArchVersion::v5TE;
 
         config.unsafe_optimizations = true;
+        config.optimizations = Dynarmic::all_safe_optimizations
+                             | Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA
+                             | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP
+                             | Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN
+                             | Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue
+                             | Dynarmic::OptimizationFlag::BlockLinking;
 
         config.code_cache_size = 1024 * 1024 * 1024;
 
@@ -332,19 +426,20 @@ int main(int argc, char** argv) {
         // signature: (JNIEnv*, jclass, jint w, jint h, jfloat cmW, jfloat cmH, jfloat diag)
         // Floats must be passed as raw 32-bit bitcasts
         uint32_t cmW, cmH, diag;
-        float f_cmW = 14.0f, f_cmH = 7.0f, f_diag = 8.0f; // 6.0f
-        
-        // DEBUG: test bigger resolution when necessary (1920x1080 screen)
-        //float f_cmW = 12.0f, f_cmH = 6.0f, f_diag = 14.0f;
+        float f_cmW = 14.0f, f_cmH = 7.0f;
+
+        float gameDiag = Config::GameSettings::Resolution::nativeDiag;
+
         std::memcpy(&cmW, &f_cmW, 4);
         std::memcpy(&cmH, &f_cmH, 4);
-        std::memcpy(&diag, &f_diag, 4);
+        std::memcpy(&diag, &gameDiag, 4);
+
+        uint32_t gameWidth = Config::GameSettings::Resolution::nativeX;
+        uint32_t gameHeight = Config::GameSettings::Resolution::nativeY;
 
         ExecuteGameFunction(cpu, memory, loader,
             "Java_com_codeglue_terraria_OctarineBridge_nativeOnResizeSurface",
-            //{ env_ptr, 0, 1280, 720, cmW, cmH, diag }
-            // DEBUG: test bigger resolution when necessary (1920x1080 screen)
-            { env_ptr, 0, 1920, 1080, cmW, cmH, diag }
+            { env_ptr, 0, gameWidth, gameHeight, cmW, cmH, diag }
         );
 
         // Lie to AndroidInterface::CheckMemoryInfo so extended worlds unlock.
@@ -375,7 +470,6 @@ int main(int argc, char** argv) {
         if (on_expansion_extracted) {
             ExecuteGameFunction(cpu, memory, loader, "Java_com_codeglue_terraria_OctarineBridge_nativeOnExpansionFileExtracted", { env_ptr, 0, fake_path_ptr });
         }
-
 
         // Tell the engine we own the full game (Terraria.java calls this with true, "")
         uint32_t on_unlock = loader.GetExport("Java_com_codeglue_terraria_OctarineBridge_nativeUnlockGame");
@@ -639,6 +733,8 @@ int main(int argc, char** argv) {
         SDL_GL_DeleteContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
+
+        exit(0);
 
     } catch (const std::exception& e) {
         std::cerr << "\n[Fatal Exception] " << e.what() << std::endl;

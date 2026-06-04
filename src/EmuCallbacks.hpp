@@ -8,10 +8,23 @@
 #include "Config.hpp"
 #include "CPUHelper.hpp"
 #include <mutex>
+#include <shared_mutex>
 
 #include "Watchpoint.hpp"
 
 class EmuCallbacks : public Dynarmic::A32::UserCallbacks {
+
+    struct CachedSyscall {
+        SyscallHandler handler;
+        std::string name;
+    };
+
+    inline static std::unordered_map<uint32_t, CachedSyscall> fast_dispatch;
+
+    static constexpr uint32_t PLT_SVC_BASE = 0x1000;
+
+    inline static std::shared_mutex dispatch_mutex;
+
 public:
     EmuCallbacks(GuestMemory& mem, ElfLoader& loader, SyscallRouter& router)
         : mem(mem), loader(loader), router(router) {}
@@ -140,19 +153,21 @@ public:
         std::exit(1);
     }
 
+    void AddFastDispatch(uint32_t swi, std::string name, SyscallHandler handler) {
+        std::unique_lock lock(dispatch_mutex);
+        fast_dispatch[swi] = {std::move(handler), std::move(name)};
+    }
+
     inline void CallSVC(uint32_t swi) override {
         if (swi == 0xFFFFFF) {
             cpu->HaltExecution(Dynarmic::HaltReason::UserDefined3);
             return;
         }
 
-        struct CachedSyscall {
-            SyscallHandler handler;
-            std::string name;
-        };
-
-        // Static cache maps the integer SWI directly to the lambda AND the string name
-        static std::unordered_map<uint32_t, CachedSyscall> fast_dispatch;
+        if (swi == 255) {
+            std::cout << "Guest requested shutdown. Exiting cleanly...\n";
+            std::_Exit(0);
+        }
 
         auto it = fast_dispatch.find(swi);
         if (it != fast_dispatch.end()) {
@@ -172,11 +187,17 @@ public:
         }
 
         // First time seeing this SWI: do the slow string lookup and cache it
-        std::string name = loader.GetSymbolName(swi);
+        if (Config::Prints::miscPrints) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "first time seeing SWI: " << std::hex << swi << std::dec << std::endl;
+        }
+        std::string name = loader.GetSymbolName(swi - PLT_SVC_BASE);
         SyscallHandler handler = router.GetHandler(name);
 
         if (handler) {
+            std::unique_lock lock(dispatch_mutex);
             fast_dispatch[swi] = {handler, name};
+            lock.unlock();
             handler(cpu);
 
             if constexpr (Config::Prints::functionCalls) {

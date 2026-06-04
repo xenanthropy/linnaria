@@ -6,6 +6,7 @@
 ElfLoader::ElfLoader(GuestMemory& memory) : mem(memory) {}
 
 uint32_t ElfLoader::ctype_array_ptr = 0;
+static constexpr uint32_t PLT_SVC_BASE = 0x1000;
 
 bool ElfLoader::Load(const std::string& filepath) {
     std::cout << "Loading ELF: " << filepath << std::endl;
@@ -109,8 +110,11 @@ void ElfLoader::InitTrampolinePage() {
 uint32_t ElfLoader::EmitSVCThunk(uint32_t id) {
     InitTrampolinePage();
     uint32_t addr = tramp_next;
+
+    // offset the svc ID (to make room for custom thumb/arm svcs)
+    uint32_t svc_id = (id == 0xFFFFFF) ? 0xFFFFFF : PLT_SVC_BASE + id;
     
-    uint32_t svc = 0xEF000000 | (id & 0x00FFFFFF); // SVC #id
+    uint32_t svc = 0xEF000000 | (svc_id & 0x00FFFFFF); // SVC #id
     uint32_t bxlr= 0xE12FFF1E;                     // BX LR (Return)
     
     mem.Write32(addr + 0, svc);

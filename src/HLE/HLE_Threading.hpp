@@ -152,10 +152,14 @@ namespace HLE::Threading {
                 config.enable_cycle_counting = false;
                 config.wall_clock_cntpct = true;  // hack?
                 config.fastmem_exclusive_access = true;
-
-                config.arch_version = Dynarmic::A32::ArchVersion::v7;
-
+                config.arch_version = Dynarmic::A32::ArchVersion::v5TE;
                 config.unsafe_optimizations = true;
+                config.optimizations = Dynarmic::all_safe_optimizations
+                                     | Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA
+                                     | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP
+                                     | Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN
+                                     | Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue
+                                     | Dynarmic::OptimizationFlag::BlockLinking;
                 config.code_cache_size = 1024 * 1024 * 1024;
 
                 // Share the global monitor, give thread a unique ID and its own CP15/TLS

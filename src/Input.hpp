@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdint>
 #include <string>
+#include "Config.hpp"
 #include "GuestMemory.hpp"
 #include "ElfLoader.hpp"
 #include "Pacing.hpp"
@@ -20,6 +21,9 @@ void ExecuteGameFunction(Dynarmic::A32::Jit& cpu, GuestMemory& memory, ElfLoader
 inline bool g_is_typing = false;
 
 namespace Input {
+
+    inline const float input_scale_x = Config::GameSettings::Resolution::nativeX / Config::GameSettings::Upscale::upscaleWidth;
+    inline const float input_scale_y = Config::GameSettings::Resolution::nativeY / Config::GameSettings::Upscale::upscaleHeight;
 
     // Octarine touch action codes (see OctarineView.onTouchEvent in the Java
     // bridge). They line up with Android MotionEvent.ACTION_DOWN/UP/MOVE
@@ -238,18 +242,31 @@ namespace Input {
             case SDL_MOUSEBUTTONDOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
                     mouse_held = true;
-                    touch_queue.push_back({0, DOWN,
-                        static_cast<float>(ev.button.x),
-                        static_cast<float>(ev.button.y),
-                        time_field()});
+
+                    float x_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.button.x * input_scale_x) :
+                                    static_cast<float>(ev.button.x);
+                    float y_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.button.y * input_scale_y) :
+                                    static_cast<float>(ev.button.y);
+
+                    touch_queue.push_back({0, DOWN, x_input, y_input, time_field()});
                 }
                 break;
             case SDL_MOUSEBUTTONUP:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
                     mouse_held = false;
+
+                    float x_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.button.x * input_scale_x) :
+                                    static_cast<float>(ev.button.x);
+                    float y_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.button.y * input_scale_y) :
+                                    static_cast<float>(ev.button.y);
+
                     touch_queue.push_back({0, UP,
-                        static_cast<float>(ev.button.x),
-                        static_cast<float>(ev.button.y),
+                        x_input,
+                        y_input,
                         time_field()});
                 }
                 break;
@@ -260,17 +277,22 @@ namespace Input {
                     // appending. A fast drag generates far more motion events
                     // than the game can drain per frame; without this the
                     // queue (and the game's internal one) would burst.
+
+                    float x_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.motion.x * input_scale_x) :
+                                    static_cast<float>(ev.motion.x);
+                    float y_input = Config::GameSettings::Upscale::upscaling ?
+                                    static_cast<float>(ev.motion.y * input_scale_y) :
+                                    static_cast<float>(ev.motion.y);
+
                     if (!touch_queue.empty()
                         && touch_queue.back().action == MOVE
                         && touch_queue.back().id == 0) {
-                        touch_queue.back().x = static_cast<float>(ev.motion.x);
-                        touch_queue.back().y = static_cast<float>(ev.motion.y);
+                        touch_queue.back().x = x_input;
+                        touch_queue.back().y = y_input;
                         touch_queue.back().time = time_field();
                     } else {
-                        touch_queue.push_back({0, MOVE,
-                            static_cast<float>(ev.motion.x),
-                            static_cast<float>(ev.motion.y),
-                            time_field()});
+                        touch_queue.push_back({0, MOVE, x_input, y_input, time_field()});
                     }
                 }
                 break;

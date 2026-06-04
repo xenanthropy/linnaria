@@ -133,4 +133,72 @@ namespace Config {
         inline constexpr bool miscPrints = false;
     }
 
+    namespace GameSettings {
+
+        namespace Upscale {
+            // enables game upscaling - make sure to specify resolution
+            // to what you want if enabled
+            inline constexpr bool upscaling = true;
+
+            // width and height resolution to upscale to
+            inline constexpr float upscaleWidth = 2560.0f;
+            inline constexpr float upscaleHeight = 1440.0f;
+        }
+
+        namespace Resolution {
+            // native game resolution
+            // recommend keeping at 720p for now as any higher
+            // introduces significant performance loss
+            inline constexpr float nativeX = 1280.0f;
+            inline constexpr float nativeY = 720.0f;
+
+            // Diagonal length - changes the scaling of UI and screen size
+            // recommended to leave at the default of 8
+            inline constexpr float nativeDiag = 8.0f;
+        }
+
+        namespace Patches {
+            // disables the on-screen joystick
+            // if unsure, leave patched out; it's annoying
+            inline constexpr bool patchTouchscreenJoystick = true;
+
+            // disables the controller button strip at the bottom of the screen
+            // that shows you what each key does. The issue is it shows controller buttons, not keys.
+            // patched by default as it takes up screen real estate
+            // disable the patch if seeing the letters a, b, x, and y gives you immense joy
+            inline constexpr bool patchControllerGuide = true;
+
+            // disables the magnifying glass that shows up when mining.
+            // is useful on mobile when your fat thumb is covering what you're mining
+            // on PC it's useless - disable the patch if you're blind or something
+            inline constexpr bool patchMagnifyingWhileMining = true;
+
+            // disables the auto-jump feature
+            // useful on mobile when you had to flick the virtual joystick up to jump
+            // insanely annoying on PC - disable patch if your thumb is broken
+            // and you can't press the space bar
+            inline constexpr bool patchAutoJump = true;
+
+            // disables the mining delay and block-placing delay
+            // useful on mobile when you can't exactly press single blocks
+            // due to your fat thumb spanning multiple blocks, needed time to re-adjust
+            // useless on PC, and makes it so you can't ever tower by placing blocks under you
+            // disable patch if you hate your life and love watching yellow boxes fill up
+            inline constexpr bool patchMineDelay = true;
+
+            // removes the aiming(?) reticle that shows which direction you're pressing
+            // in controller mode.
+            // helpful when using a *real* controller to see where your "cursor" is
+            // useless for us and just gets in the way
+            // disable the patch if you enjoy watching throbbing circles
+            inline constexpr bool patchControllerReticle = true;
+
+            // removes the auto-opening of doors when you walk near them
+            // helpful on mobile where it could be harder to tap precisely to open doors
+            // *also* helpful on PC if you don't wanna open doors yourself
+            // patched by default as auto-opening doors is dangerous near enemies
+            inline constexpr bool patchAutoDoorOpening = true;
+        }
+    }
+
 }

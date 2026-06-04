@@ -1,4 +1,5 @@
 #pragma once
+#include "Config.hpp"
 #include "SyscallRouter.hpp"
 #include "GuestMemory.hpp"
 #include "Pacing.hpp"
@@ -32,8 +33,6 @@ namespace HLE::OpenGL {
         ROUTE_REGISTER(router, "glAttachShader", [](Dynarmic::A32::Jit* cpu) { glAttachShader(cpu->Regs()[0], cpu->Regs()[1]); });
         ROUTE_REGISTER(router, "glUniform1i", [](Dynarmic::A32::Jit* cpu) { glUniform1i(cpu->Regs()[0], cpu->Regs()[1]); });
         ROUTE_REGISTER(router, "glTexParameteri", [](Dynarmic::A32::Jit* cpu) { glTexParameteri(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2]); });
-        ROUTE_REGISTER(router, "glViewport", [](Dynarmic::A32::Jit* cpu) { glViewport(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
-        ROUTE_REGISTER(router, "glScissor",  [](Dynarmic::A32::Jit* cpu) { glScissor (cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
         ROUTE_REGISTER(router, "glCreateShader", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = glCreateShader(cpu->Regs()[0]); });
         ROUTE_REGISTER(router, "glCreateProgram", [](Dynarmic::A32::Jit* cpu) { cpu->Regs()[0] = glCreateProgram(); });
         ROUTE_REGISTER(router, "glDetachShader", [](Dynarmic::A32::Jit* cpu) { glDetachShader(cpu->Regs()[0], cpu->Regs()[1]); });
@@ -231,6 +230,100 @@ namespace HLE::OpenGL {
             const void* host_pixels = pixels_val ? memory.GetHostPointer(pixels_val) : nullptr;
     
             glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, host_pixels);
+        });
+
+        if (Config::GameSettings::Upscale::upscaling) {
+            ROUTE_REGISTER(router, "glViewport", [](Dynarmic::A32::Jit* cpu) {
+                GLint x = static_cast<GLint>(cpu->Regs()[0]);
+                GLint y = static_cast<GLint>(cpu->Regs()[1]);
+                GLsizei width = static_cast<GLsizei>(cpu->Regs()[2]);
+                GLsizei height = static_cast<GLsizei>(cpu->Regs()[3]);
+
+                GLint current_fbo;
+                ::glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
+
+                // Only upscale if rendering directly to the screen (backbuffer)
+                if (current_fbo == 0) {
+                    float scale_x = Config::GameSettings::Upscale::upscaleWidth / Config::GameSettings::Resolution::nativeX;
+                    float scale_y = Config::GameSettings::Upscale::upscaleHeight / Config::GameSettings::Resolution::nativeY;
+
+                    ::glViewport(
+                        static_cast<GLint>(x * scale_x),
+                        static_cast<GLint>(y * scale_y),
+                        static_cast<GLsizei>(width * scale_x),
+                        static_cast<GLsizei>(height * scale_y)
+                    );
+                } else {
+                    ::glViewport(x, y, width, height);
+                }
+            });
+
+            ROUTE_REGISTER(router, "glScissor", [](Dynarmic::A32::Jit* cpu) {
+                GLint x = static_cast<GLint>(cpu->Regs()[0]);
+                GLint y = static_cast<GLint>(cpu->Regs()[1]);
+                GLsizei width = static_cast<GLsizei>(cpu->Regs()[2]);
+                GLsizei height = static_cast<GLsizei>(cpu->Regs()[3]);
+
+                GLint current_fbo;
+                ::glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
+
+                if (current_fbo == 0) {
+                    float scale_x = Config::GameSettings::Upscale::upscaleWidth / Config::GameSettings::Resolution::nativeX;
+                    float scale_y = Config::GameSettings::Upscale::upscaleHeight / Config::GameSettings::Resolution::nativeY;
+
+                    ::glScissor(
+                        static_cast<GLint>(x * scale_x),
+                        static_cast<GLint>(y * scale_y),
+                        static_cast<GLsizei>(width * scale_x),
+                        static_cast<GLsizei>(height * scale_y)
+                    );
+                } else {
+                    ::glScissor(x, y, width, height);
+                }
+            });
+        } else {
+            ROUTE_REGISTER(router, "glViewport", [](Dynarmic::A32::Jit* cpu) { glViewport(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
+            ROUTE_REGISTER(router, "glScissor",  [](Dynarmic::A32::Jit* cpu) { glScissor (cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3]); });
+        }
+
+        ROUTE_REGISTER(router, "glUniform4f", [&memory](Dynarmic::A32::Jit* cpu) {
+            GLint location = static_cast<GLint>(cpu->Regs()[0]);
+
+            // ARM softfp calling convention passes floats in integer registers.
+            // We read the raw bits and safely copy them into floats.
+            uint32_t r1 = cpu->Regs()[1];
+            uint32_t r2 = cpu->Regs()[2];
+            uint32_t r3 = cpu->Regs()[3];
+
+            // The 5th argument (v3) is passed on the stack
+            uint32_t sp = cpu->Regs()[13];
+            uint32_t stack_val = memory.Read32(sp);
+
+            float v0, v1, v2, v3;
+            std::memcpy(&v0, &r1, sizeof(float));
+            std::memcpy(&v1, &r2, sizeof(float));
+            std::memcpy(&v2, &r3, sizeof(float));
+            std::memcpy(&v3, &stack_val, sizeof(float));
+
+            ::glUniform4f(location, v0, v1, v2, v3);
+        });
+
+        ROUTE_REGISTER(router, "glDrawArrays", [](Dynarmic::A32::Jit* cpu) {
+            GLenum mode   = static_cast<GLenum>(cpu->Regs()[0]);
+            GLint first   = static_cast<GLint>(cpu->Regs()[1]);
+            GLsizei count = static_cast<GLsizei>(cpu->Regs()[2]);
+
+            ::glDrawArrays(mode, first, count);
+        });
+
+        ROUTE_REGISTER(router, "glDeleteBuffers", [&memory](Dynarmic::A32::Jit* cpu) {
+            GLsizei n            = static_cast<GLsizei>(cpu->Regs()[0]);
+            uint32_t buffers_ptr = cpu->Regs()[1];
+
+            if (n > 0 && buffers_ptr) {
+                const GLuint* buffers = reinterpret_cast<const GLuint*>(memory.GetHostPointer(buffers_ptr));
+                ::glDeleteBuffers(n, buffers);
+            }
         });
     }
 }
