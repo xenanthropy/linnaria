@@ -8,13 +8,13 @@ namespace HLE::SoftFloat {
     inline void RegisterAll(GuestMemory& memory, EmuCallbacks& callback) {
         // Helper to patch a function entry with an SVC
         auto patchArm = [&](uint32_t addr, uint32_t swi) {
-            memory.Write32(addr, 0xEF000000 | (swi & 0x00FFFFFF));   // ARM SVC
-            memory.Write32(addr + 4, 0xE12FFF1E);     // BX LR
+            memory.Write32(memory.CODE_BASE + addr, 0xEF000000 | (swi & 0x00FFFFFF));
+            memory.Write32(memory.CODE_BASE + addr + 4, 0xE12FFF1E);
         };
 
         auto patchThumb = [&](uint32_t addr, uint8_t swi) {
-            memory.Write16(addr, 0xDF00 | swi);   // THUMB SVC
-            memory.Write16(addr + 2, 0x4770);     // BX LR (Thumb)
+            memory.Write16(memory.CODE_BASE + addr, 0xDF00 | swi);
+            memory.Write16(memory.CODE_BASE + addr + 2, 0x4770);
         };
 
         // Assign a base SVC number for soft-float
@@ -104,5 +104,40 @@ namespace HLE::SoftFloat {
             std::memcpy(&cpu->Regs()[0], &res, 4);
         });
         */
+
+        // __aeabi_idivmod  -- ARM, 0x004EF6EC
+        patchArm(0x004EF6EC, ARM_BASE + 0);
+        callback.AddFastDispatch(ARM_BASE + 0, "__aeabi_idivmod", [](Dynarmic::A32::Jit* cpu) {
+            int32_t num = static_cast<int32_t>(cpu->Regs()[0]);
+            int32_t den = static_cast<int32_t>(cpu->Regs()[1]);
+            if (den == 0) {
+                if      (num > 0) cpu->Regs()[0] = 0x7FFFFFFFu;
+                else if (num < 0) cpu->Regs()[0] = 0x80000000u;
+                else              cpu->Regs()[0] = 0u;
+                cpu->Regs()[1] = 0u;
+                return;
+            }
+            if (num == INT32_MIN && den == -1) {
+                cpu->Regs()[0] = 0x80000000u;
+                cpu->Regs()[1] = 0u;
+                return;
+            }
+            cpu->Regs()[0] = static_cast<uint32_t>(num / den);
+            cpu->Regs()[1] = static_cast<uint32_t>(num % den);
+        });
+
+        // __aeabi_uidivmod -- ARM, 0x004EF5F0
+        patchArm(0x004EF5F0, ARM_BASE + 1);
+        callback.AddFastDispatch(ARM_BASE + 1, "__aeabi_uidivmod", [](Dynarmic::A32::Jit* cpu) {
+            uint32_t num = cpu->Regs()[0];
+            uint32_t den = cpu->Regs()[1];
+            if (den == 0) {
+                cpu->Regs()[0] = (num != 0) ? 0xFFFFFFFFu : 0u;
+                cpu->Regs()[1] = 0u;
+                return;
+            }
+            cpu->Regs()[0] = num / den;
+            cpu->Regs()[1] = num % den;
+        });
     }
 }
